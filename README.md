@@ -68,6 +68,13 @@ apart from the replies. The stub redraws on a resize (a pane starts narrow when
 a phone attaches first and widens when a laptop joins), so the recap always
 fills the pane's current width; the transcript is read once and cached.
 
+An idle claude session is not slept while work would die with it: a
+background command or monitor (a child shell of the agent), a background
+agent or workflow (its transcript under `<session>/` written in the last 10
+minutes), a session-only CronCreate job made by the running process (live
+until cancelled, 7 days for recurring, a day for one-shot), or a pending
+ScheduleWakeup. The check runs last and reports `busy: …`.
+
 Names stay in step (`sync_names`, on by default): renaming a claude pane in
 Herdr types `/rename <name>` into its agent — only while it is idle with a
 verifiably empty composer, retried on later ticks, at most twice — and a
@@ -250,7 +257,7 @@ focus/command wakes only.
 
 ## Tests
 
-`python3 -m pytest tests/ -q` — 189 tests: the decision logic, the
+`python3 -m pytest tests/ -q` — 194 tests: the decision logic, the
 sleep/wake state machine, pane identity and orphans, the watcher tick and
 loop (idle clocks, backoff, the watcher lock), the focus hook, the stub and
 its conversation recap and restart resume command, the 3.9 TOML subset parser, and legacy migration,

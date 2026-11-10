@@ -4,6 +4,7 @@ machine, the watcher tick, the focus hook, and the in-pane stub — against a fa
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
 import signal
@@ -112,6 +113,8 @@ class FakeHerdr:
         self.signals: list[tuple[int, int]] = []
         self.execvps: list[tuple[str, list[str]]] = []
         self.resume: dict[str, list[str]] = {}   # pane -> resume command the claim holder reported
+        self.children: list[str] = []          # commands of the agent process's children
+        self.elapsed: float | None = 10 * 24 * 3600   # how long the agent process has run
 
     def kill(self, pid: int, sig: int) -> None:
         self.signals.append((pid, sig))
@@ -221,6 +224,9 @@ def fake(state: Path, monkeypatch: pytest.MonkeyPatch) -> FakeHerdr:
     monkeypatch.setattr(sleeper.time, "sleep", lambda s: None)
     monkeypatch.setattr(sleeper, "EXIT_WAIT_SECONDS", 2)
     monkeypatch.setattr(sleeper.os, "kill", f.kill)
+    # the busy-session check reads real `ps`; the fake agent's pid (1) is launchd's
+    monkeypatch.setattr(sleeper, "child_commands", lambda pid: list(f.children))
+    monkeypatch.setattr(sleeper, "process_elapsed", lambda pid: f.elapsed)
     transcript(state, UUID, 30)
     return f
 
@@ -2230,3 +2236,74 @@ def test_times_shown_in_the_stub_carry_the_local_zone(monkeypatch: pytest.Monkey
     finally:
         monkeypatch.delenv("TZ")
         time.tzset()
+
+
+# ------------------------------------------------------------- busy session
+
+def iso(seconds_ago: float) -> str:
+    return dt.datetime.fromtimestamp(time.time() - seconds_ago, dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def tool_rows(name: str, inp: dict[str, Any], result: str, seconds_ago: float, tid: str) -> list[dict[str, Any]]:
+    return [{"type": "assistant", "timestamp": iso(seconds_ago), "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": tid, "name": name, "input": inp}]}},
+            {"type": "user", "timestamp": iso(seconds_ago), "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": tid, "content": result}]}}]
+
+
+def busy(fake: FakeHerdr) -> tuple[bool, str]:
+    ok, reason, _ = sleeper.assess(agent(), fake.agents, 12, {}, idle_since=time.time() - 13 * 3600)
+    return ok, reason
+
+
+def test_a_background_command_keeps_the_session_awake(fake: FakeHerdr) -> None:
+    fake.children = ["chrome-devtools-mcp", "/bin/zsh -c source /u/.claude/shell-snapshots/snapshot-zsh-1.sh && eval tail -f x"]
+    ok, reason = busy(fake)
+    assert not ok and reason.startswith("busy: 1 background command")
+    fake.children = ["chrome-devtools-mcp", "node /tmp/bunx/playwright-mcp"]   # MCP servers are not work in flight
+    assert busy(fake)[0]
+
+
+def test_a_live_background_agent_keeps_the_session_awake(fake: FakeHerdr, state: Path) -> None:
+    side = state / "projects" / "proj" / UUID / "subagents"
+    side.mkdir(parents=True)
+    f = side / "agent-a1.jsonl"
+    f.write_text("{}\n")
+    assert busy(fake)[1] == "busy: a background agent or workflow is still writing"
+    old = time.time() - 3600
+    os.utime(f, (old, old))
+    assert busy(fake)[0]
+
+
+def test_session_crons_keep_the_session_awake_until_gone(fake: FakeHerdr, state: Path) -> None:
+    made = tool_rows("CronCreate", {"cron": "17 10,22 * * *", "prompt": "check", "recurring": True},
+                     "Scheduled recurring job 0d92fd0a (17 10,22 * * *). Session-only", 3600, "t1")
+    write_transcript(state, made)
+    ok, reason = busy(fake)
+    assert not ok and "0d92fd0a" in reason
+    write_transcript(state, made + tool_rows("CronDelete", {"id": "0d92fd0a"}, "Cancelled job 0d92fd0a.", 60, "t2"))
+    assert busy(fake)[0]                                      # cancelled
+    write_transcript(state, made)
+    fake.elapsed = 600                                        # the process restarted after it was made: it died
+    assert busy(fake)[0]
+    fake.elapsed = 10 * 24 * 3600
+    write_transcript(state, tool_rows("CronCreate", {"cron": "0 9 * * *", "recurring": False},
+                                      "Scheduled one-shot job abcdef12 (0 9 * * *).", 30 * 3600, "t3"))
+    assert busy(fake)[0]                                      # a one-shot older than a day has fired
+
+
+def test_a_pending_wakeup_keeps_the_session_awake(fake: FakeHerdr, state: Path) -> None:
+    write_transcript(state, tool_rows("ScheduleWakeup", {"delaySeconds": 1200, "prompt": "x"}, "Next wakeup", 300, "w1"))
+    ok, reason = busy(fake)
+    assert not ok and "wakeup is pending" in reason
+    write_transcript(state, tool_rows("ScheduleWakeup", {"delaySeconds": 1200, "prompt": "x"}, "Next wakeup", 1800, "w1"))
+    assert busy(fake)[0]                                      # already fired
+    write_transcript(state, tool_rows("ScheduleWakeup", {"delaySeconds": 1200, "prompt": "x"}, "Next wakeup", 600, "w1")
+                     + tool_rows("ScheduleWakeup", {"stop": True}, "stopped", 300, "w2"))
+    assert busy(fake)[0]                                      # the loop was stopped
+
+
+def test_process_elapsed_parses_ps_etime(monkeypatch: pytest.MonkeyPatch) -> None:
+    for out, secs in (("05:03", 303), ("1:02:03", 3723), ("2-01:00:00", 176400)):
+        monkeypatch.setattr(sleeper.subprocess, "run", lambda *a, _o=out, **k: types.SimpleNamespace(stdout=_o + "\n"))
+        assert sleeper.process_elapsed(1) == secs

@@ -965,6 +965,116 @@ def wake_name(entry: dict) -> str:
 SLEEPABLE_STATUSES = {"idle", "done"}
 
 
+# ------------------------------------------------------------ busy session
+
+# An idle agent can still have work in flight that dies with its process: background commands
+# and monitors (child shells), background agents and workflows (in-process; their transcripts
+# keep being written), and session-only schedules — CronCreate jobs ("not written to disk, dies
+# when Claude exits") and ScheduleWakeup. Sleeping such a session would silently cancel them.
+BUSY_RECENT_SECONDS = 600            # a subagent/workflow transcript written this recently is live
+CRON_RECURRING_TTL = 7 * 24 * 3600   # recurring session crons auto-expire after 7 days
+CRON_ONESHOT_TTL = 24 * 3600         # a one-shot fires within a day of being made
+TOOL_MARKERS = (b'"CronCreate"', b'"CronDelete"', b'"ScheduleWakeup"', b'"tool_use_id"')
+
+
+def process_elapsed(pid: int) -> float | None:
+    """Seconds since pid started (`ps -o etime`, locale-free), None when it cannot be read."""
+    try:
+        out = subprocess.run(["ps", "-o", "etime=", "-p", str(pid)], capture_output=True, text=True,
+                             timeout=10).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.fullmatch(r"(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)", out)
+    if not m:
+        return None
+    d, h, mi, se = (int(x or 0) for x in m.groups())
+    return float(((d * 24 + h) * 60 + mi) * 60 + se)
+
+
+def child_commands(pid: int) -> list[str]:
+    try:
+        out = subprocess.run(["ps", "-axo", "ppid=,command="], capture_output=True, text=True, timeout=15).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    rows = (line.strip().split(None, 1) for line in out.splitlines() if line.strip())
+    return [r[1] for r in rows if len(r) == 2 and r[0] == str(pid)]
+
+
+def iso_epoch(stamp: object) -> float | None:
+    try:
+        return dt.datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def pending_schedules(path: Path, since: float, now: float) -> str | None:
+    """A CronCreate job or ScheduleWakeup made by the running process (since = its start) that is
+    still pending, as a reason; None when there is none. Only lines naming the tools are parsed."""
+    uses: dict[str, tuple[str, dict, float]] = {}
+    results: dict[str, str] = {}
+    with path.open("rb") as fh:
+        for raw in fh:
+            if not any(m in raw for m in TOOL_MARKERS[:3]) and b"Cancelled job" not in raw \
+                    and b"Scheduled " not in raw:
+                continue
+            try:
+                e = json.loads(raw)
+            except ValueError:
+                continue
+            content = (e.get("message") or {}).get("content") if isinstance(e.get("message"), dict) else None
+            for b in content if isinstance(content, list) else []:
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "tool_use" and b.get("name") in ("CronCreate", "CronDelete", "ScheduleWakeup"):
+                    ts = iso_epoch(e.get("timestamp"))
+                    if ts is not None and ts >= since:
+                        uses[str(b.get("id"))] = (b["name"], b.get("input") or {}, ts)
+                elif b.get("type") == "tool_result":
+                    text = b.get("content")
+                    if isinstance(text, list):
+                        text = " ".join(str(x.get("text", "")) for x in text if isinstance(x, dict))
+                    results[str(b.get("tool_use_id"))] = str(text or "")
+    cancelled = {str(u[1].get("id")) for k, u in uses.items()
+                 if u[0] == "CronDelete" and "Cancelled" in results.get(k, "")}
+    for k, (name, inp, ts) in uses.items():
+        if name != "CronCreate":
+            continue
+        m = re.search(r"job ([0-9a-f]{6,})", results.get(k, ""))
+        if not m or m.group(1) in cancelled:
+            continue
+        ttl = CRON_RECURRING_TTL if inp.get("recurring", True) else CRON_ONESHOT_TTL
+        if now - ts < ttl:
+            return f"session-only scheduled job {m.group(1)} ({inp.get('cron', '?')}) would die with it"
+    wakes = sorted((ts, inp) for name, inp, ts in uses.values() if name == "ScheduleWakeup")
+    if wakes and not wakes[-1][1].get("stop"):
+        ts, inp = wakes[-1]
+        due = ts + min(max(float(inp.get("delaySeconds") or 0), 60), 3600)
+        if due > now:
+            return f"a scheduled wakeup is pending ({dt.datetime.fromtimestamp(due).strftime('%H:%M')})"
+    return None
+
+
+def session_busy(pane: str, uuid: str) -> str | None:
+    """Why this idle claude session still has work that sleeping would kill, or None."""
+    present, _argv, pid = agent_process(pane, "claude")
+    if present is not True or not pid:
+        return None  # nothing identifiable to inspect; the exit path refuses a pid it cannot find
+    bg = [c for c in child_commands(int(pid)) if "shell-snapshots/snapshot-" in c]
+    if bg:
+        return f"{len(bg)} background command(s) or monitor(s) running"
+    path = transcript_for(uuid)
+    if path is None:
+        return None
+    now = time.time()
+    side = path.with_suffix("")  # <uuid>/ holds subagents/ and workflows/
+    if side.is_dir():
+        newest = max((f.stat().st_mtime for f in side.rglob("*.jsonl")), default=0.0)
+        if now - newest < BUSY_RECENT_SECONDS:
+            return "a background agent or workflow is still writing"
+    elapsed = process_elapsed(int(pid))
+    return pending_schedules(path, now - elapsed if elapsed is not None else 0.0, now)
+
+
 def assess(agent: dict, all_agents: list[dict], idle_hours: float, journal: dict,
            exclude: set[str] | None = None, idle_since: float | None = None,
            allow_focused: bool = False) -> tuple[bool, str, float | None]:
@@ -996,12 +1106,16 @@ def assess(agent: dict, all_agents: list[dict], idle_hours: float, journal: dict
         return False, f"session also open in {', '.join(a['pane_id'] for a in others)}", None
     if kind == "claude" and transcript_for(uuid) is None:
         return False, "no transcript on disk (nothing to resume)", None
+    idle = None
     if idle_since is not None:
         idle = (time.time() - idle_since) / 3600
         if idle < idle_hours:
             return False, f"idle {idle:.1f}h < {idle_hours:g}h", idle
-        return True, f"idle {idle:.1f}h", idle
-    return True, "manual", None
+    if kind == "claude":  # last: it inspects processes and the transcript
+        busy = session_busy(pane, uuid)
+        if busy:
+            return False, f"busy: {busy}", idle
+    return (True, f"idle {idle:.1f}h", idle) if idle is not None else (True, "manual", None)
 
 
 def recheck(agent: dict, idle_hours: float, journal: dict, exclude: set[str],
