@@ -12,6 +12,9 @@ unchanged, and the plugin adds what only a plugin can do:
     wake stub is left running there), and wake by command
   * slept panes keep their sidebar row (`pane report-agent` claim) with a
     `<kind> · sleeping` display label
+  * the stub shows the tail of the session's conversation above its wake
+    prompt (claude, from the transcript; `preview_lines`), so a slept pane
+    can be judged before it is woken
 
 Exit path per agent kind: SIGTERM for claude and opencode (both shut down
 cleanly; a draft in the composer is discarded, never submitted — this is why
@@ -118,6 +121,7 @@ import sys
 import tempfile
 import time
 import traceback
+import unicodedata
 from pathlib import Path
 
 try:
@@ -190,6 +194,7 @@ DEFAULTS = {
     "poll_seconds": WATCHER_POLL_SECONDS_DEFAULT,
     "notify": True,
     "wake_on_focus": True,
+    "preview_lines": 100,        # conversation rows the stub shows above its prompt; 0 = none
 }
 
 
@@ -507,7 +512,8 @@ def load_config() -> tuple[dict, dict[str, str]]:
                 raise ConfigError(f"{CONFIG_FILE}: unknown key {k!r}")
     env = {"idle_hours": "HERDR_SLEEPER_IDLE_HOURS", "idle": "HERDR_SLEEPER_IDLE", "exclude": "HERDR_SLEEPER_EXCLUDE",
            "agents": "HERDR_SLEEPER_AGENTS", "poll_seconds": "HERDR_SLEEPER_POLL_SECONDS",
-           "notify": "HERDR_SLEEPER_NOTIFY", "wake_on_focus": "HERDR_SLEEPER_WAKE_ON_FOCUS"}
+           "notify": "HERDR_SLEEPER_NOTIFY", "wake_on_focus": "HERDR_SLEEPER_WAKE_ON_FOCUS",
+           "preview_lines": "HERDR_SLEEPER_PREVIEW_LINES"}
     if "HERDR_SLEEPER_IDLE" in os.environ and "HERDR_SLEEPER_IDLE_HOURS" in os.environ:
         raise ConfigError("set only one of HERDR_SLEEPER_IDLE and HERDR_SLEEPER_IDLE_HOURS")
     for k, var in env.items():
@@ -560,6 +566,12 @@ def load_config() -> tuple[dict, dict[str, str]]:
     for key in ("notify", "wake_on_focus"):
         if not isinstance(values[key], bool):
             raise ConfigError(f"{key} must be a boolean")
+    lines = values["preview_lines"]
+    if source["preview_lines"].startswith("$") and re.fullmatch(r"\s*\d+\s*", lines):  # env values are text
+        lines = int(lines)
+    if isinstance(lines, bool) or not isinstance(lines, int) or not 0 <= lines <= 1000:
+        raise ConfigError(f"preview_lines must be a whole number within 0..1000, got {values['preview_lines']!r}")
+    values["preview_lines"] = lines
     return values, source
 
 
@@ -1182,6 +1194,303 @@ def sleep_agent(agent: dict, idle_hours: float, exclude: set[str], dry_run: bool
     return True, "slept"
 
 
+# ------------------------------------------------------------------ recap
+
+# What the stub shows above its wake prompt: the tail of the session's conversation, rebuilt
+# from the transcript (the pane's own screen is cleared for the stub). Read-only and cosmetic:
+# anything that goes wrong costs the recap, never the stub.
+RECAP_WINDOWS = (1 << 20, 4 << 20, 16 << 20)  # tail bytes read in turn; transcripts reach tens of MB
+RECAP_PIN_ROWS = 6        # rows of the last prompt kept above the tail when the tail alone would cut it off
+RECAP_TOOL_KEYS = ("description", "command", "file_path", "path", "pattern", "url", "query", "skill", "prompt")
+# Transcript text must not drive the pane's terminal: escape sequences, C0/C1 controls (newline
+# excepted) and bidi overrides that would reorder what is shown are dropped.
+ESCAPE_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[@-_]?)")
+CONTROL_RE = re.compile(r"[\x00-\x09\x0b-\x1f\x7f-\x9f​‎‏‪-‮⁦-⁩]")
+# Context Claude Code injects into user turns, and the wrappers around pasted text.
+PROMPT_DROP_RE = re.compile(r"<(system-reminder|local-command-caveat|local-command-stdout|local-command-stderr|"
+                            r"bash-stdout|bash-stderr|task-notification)>.*?</\1>", re.S)
+PROMPT_TAG_RE = re.compile(r"</?pasted_content[^>]*>")
+
+
+def char_cells(ch: str) -> int:
+    """Terminal cells one character takes: 2 for wide (CJK, emoji), 0 for combining marks and joiners."""
+    if unicodedata.combining(ch) or ch in "‌‍︎️":
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def cells(text: str) -> int:
+    return sum(char_cells(ch) for ch in text)
+
+
+def clip_cells(text: str, width: int) -> str:
+    """text cut to at most `width` cells, ending in an ellipsis when it did not fit."""
+    if cells(text) <= width:
+        return text
+    out, used = "", 0
+    for ch in text:
+        if used + char_cells(ch) > width - 1:
+            break
+        out, used = out + ch, used + char_cells(ch)
+    return out + "…"
+
+
+def wrap_cells(text: str, width: int, first: str, rest: str) -> list[str]:
+    """Rows of at most `width` cells, `first` leading the first row and `rest` the others.
+
+    Breaks at a space when the word carried over is short, anywhere otherwise (Korean or
+    Japanese text has few spaces to wait for, and its characters are two cells wide).
+    """
+    rows: list[str] = []
+    for para in text.split("\n"):
+        lead = first if not rows else rest
+        room = max(1, width - cells(lead))
+        line, used = "", 0
+        for ch in para:
+            w = char_cells(ch)
+            if used + w > room and line:
+                cut = line.rfind(" ")
+                if cut > 0 and cells(line[cut + 1:]) <= room // 3:
+                    rows.append((lead + line[:cut]).rstrip())
+                    line = line[cut + 1:]
+                else:
+                    rows.append((lead + line).rstrip())
+                    line = ""
+                lead = rest
+                room = max(1, width - cells(lead))
+                used = cells(line)
+                if not line and ch == " ":
+                    continue
+            line += ch
+            used += w
+        rows.append((lead + line).rstrip())
+    return rows
+
+
+def clean_text(text: str) -> str:
+    """Transcript text made safe and compact for the pane: no control bytes, single blank lines."""
+    text = CONTROL_RE.sub("", ESCAPE_RE.sub("", text.replace("\t", "    ")))
+    text = re.sub(r"[  ]+\n", "\n", text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def prompt_text(blocks: list) -> str:
+    """A human prompt as the recap shows it: slash commands and `!` input as typed, injected context dropped."""
+    parts = []
+    for b in blocks:
+        if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str):
+            parts.append(b["text"])
+        elif isinstance(b, dict) and b.get("type") == "image":
+            parts.append("[image]")
+    text = "\n".join(parts)
+    command = re.search(r"<command-name>(.*?)</command-name>", text, re.S)
+    if command:
+        args = re.search(r"<command-args>(.*?)</command-args>", text, re.S)
+        return f"{command.group(1).strip()} {args.group(1).strip() if args else ''}".strip()
+    bash = re.search(r"<bash-input>(.*?)</bash-input>", text, re.S)
+    if bash:
+        return "! " + bash.group(1).strip()
+    return PROMPT_TAG_RE.sub("", PROMPT_DROP_RE.sub("", text)).strip()
+
+
+def tool_label(block: dict) -> tuple[str, str]:
+    """(name, detail) of a tool call — its description, command, file name or pattern, first line."""
+    name = str(block.get("name") or "tool")
+    if name.startswith("mcp__"):
+        name = name.split("__", 2)[-1]
+    inp = block.get("input") if isinstance(block.get("input"), dict) else {}
+    for key in RECAP_TOOL_KEYS:
+        v = inp.get(key)
+        if isinstance(v, str) and v.strip():
+            v = os.path.basename(v.rstrip("/")) if key in ("file_path", "path") else v
+            return name, v.strip().splitlines()[0]
+    return name, ""
+
+
+def transcript_tail(path: Path, window: int) -> tuple[list[dict], bool]:
+    """The entries in the last `window` bytes of a transcript, and whether that was all of it."""
+    with path.open("rb") as fh:
+        size = fh.seek(0, os.SEEK_END)
+        start = max(0, size - window)
+        fh.seek(start)
+        lines = fh.read().split(b"\n")
+    if start:
+        lines = lines[1:]  # the window starts mid-line
+    entries = []
+    for raw in lines:
+        if not raw.strip():
+            continue
+        try:
+            obj = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(obj, dict):
+            entries.append(obj)
+    return entries, start == 0
+
+
+def recap_items(entries: list[dict]) -> tuple[list[tuple[str, str, str]], str | None]:
+    """(kind, text, detail) items of the current branch, oldest first, and its newest timestamp.
+
+    The branch is walked back over parent links from the newest entry: a rewind leaves the
+    abandoned branch in the file, so file order alone would mix it in; a compaction boundary
+    links on through logicalParentUuid. Thinking, tool results, injected context (meta rows,
+    task notifications, peer messages) and compaction summaries are left out.
+    """
+    by_uuid = {e["uuid"]: e for e in entries if isinstance(e.get("uuid"), str)}
+    cur = next((e for e in reversed(entries) if isinstance(e.get("uuid"), str) and not e.get("isSidechain")), None)
+    chain: list[dict] = []
+    seen: set[str] = set()
+    while cur is not None and cur["uuid"] not in seen:
+        seen.add(cur["uuid"])
+        chain.append(cur)
+        parent = cur.get("parentUuid") or cur.get("logicalParentUuid")
+        cur = by_uuid.get(parent) if isinstance(parent, str) else None
+    chain.reverse()
+    stamp = next((e["timestamp"] for e in reversed(chain) if isinstance(e.get("timestamp"), str)), None)
+    items: list[tuple[str, str, str]] = []
+    for e in chain:
+        kind = e.get("type")
+        if kind == "system":
+            if e.get("subtype") == "compact_boundary":
+                items.append(("mark", "conversation compacted", ""))
+            elif e.get("subtype") == "away_summary" and isinstance(e.get("content"), str):
+                items.append(("note", e["content"], ""))
+            continue
+        if kind not in ("user", "assistant") or e.get("isMeta") or e.get("isCompactSummary"):
+            continue
+        message = e.get("message") if isinstance(e.get("message"), dict) else {}
+        content = message.get("content")
+        blocks = [{"type": "text", "text": content}] if isinstance(content, str) else content
+        if not isinstance(blocks, list):
+            continue
+        if kind == "user":
+            origin = e.get("origin")
+            if isinstance(origin, dict) and origin.get("kind") not in (None, "human"):
+                continue  # a task notification or peer message: context the agent got, not a prompt
+            text = prompt_text(blocks)
+            if text:
+                items.append(("user", text, ""))
+            continue
+        for b in blocks:
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "text" and isinstance(b.get("text"), str) and b["text"].strip():
+                items.append(("assistant", b["text"], ""))
+            elif b.get("type") == "tool_use":
+                items.append(("tool", *tool_label(b)))
+    return items, stamp
+
+
+def recap_rows(items: list[tuple[str, str, str]], width: int) -> tuple[list[tuple[str, str]], tuple[int, int] | None]:
+    """(style, text) display rows for the items, and the row span of the last prompt.
+
+    A run of tool calls between two texts is one row (`3 tool calls: Bash ×2, Edit`), so a
+    long autonomous stretch does not push the conversation out of the budget.
+    """
+    rows: list[tuple[str, str]] = []
+    span = None
+    i = 0
+    while i < len(items):
+        kind, text, _detail = items[i]
+        if kind == "tool":
+            run = []
+            while i < len(items) and items[i][0] == "tool":
+                run.append(items[i])
+                i += 1
+            if len(run) == 1:
+                label = run[0][1] + (f": {run[0][2]}" if run[0][2] else "")
+            else:
+                counts: dict[str, int] = {}
+                for _kind, name, _d in run:
+                    counts[name] = counts.get(name, 0) + 1
+                label = f"{len(run)} tool calls: " + ", ".join(n if c == 1 else f"{n} ×{c}" for n, c in counts.items())
+            rows.append(("dim", clip_cells("  ⎿ " + " ".join(clean_text(label).split()), width)))
+            continue
+        i += 1
+        text = clean_text(text)
+        if not text:
+            continue
+        if kind == "user":
+            if rows:
+                rows.append(("", ""))
+            start = len(rows)
+            rows.extend(("bold", r) for r in wrap_cells(text, width, "❯ ", "  "))
+            span = (start, len(rows))
+        elif kind == "assistant":
+            text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)  # bold markers are noise without a renderer
+            rows.extend(("", r) for r in wrap_cells(text, width, "⏺ ", "  "))
+        elif kind == "note":
+            rows.extend(("dim", r) for r in wrap_cells(text, width, "※ ", "  "))
+        else:
+            head = clip_cells(f"── {text} ", width)
+            rows.append(("dim", head + "─" * (width - cells(head))))
+    return rows, span
+
+
+def drop_blank_lead(rows: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    i = 0
+    while i < len(rows) and not rows[i][1]:
+        i += 1
+    return rows[i:]
+
+
+def local_stamp(stamp: str | None) -> str | None:
+    """A transcript timestamp (UTC ISO) as local `MM-DD HH:MM`."""
+    try:
+        return dt.datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).astimezone().strftime("%m-%d %H:%M")
+    except ValueError:
+        return None
+
+
+def recap_lines(path: Path, budget: int, width: int, color: bool = False) -> list[str]:
+    """The recap block: a header, at most `budget` conversation rows, a footer ([] when nothing to show).
+
+    The tail is read in growing windows until it fills the budget and holds a prompt. When the
+    budget cuts off the start of the last prompt, its first rows stay pinned above the tail — what
+    was asked is the best clue to whether a pane is worth waking.
+    """
+    if budget <= 0:
+        return []
+    width = max(20, width)
+    rows: list[tuple[str, str]] = []
+    span, stamp = None, None
+    for window in RECAP_WINDOWS:
+        entries, whole = transcript_tail(path, window)
+        items, stamp = recap_items(entries)
+        rows, span = recap_rows(items, width)
+        if whole or (len(rows) >= budget and span is not None):
+            break
+    if not rows:
+        return []
+    if len(rows) > budget:
+        cut = len(rows) - budget
+        if span is not None and span[0] < cut and budget >= 4 * RECAP_PIN_ROWS:
+            pin = rows[span[0]:min(span[1], span[0] + RECAP_PIN_ROWS)]
+            rows = pin + [("dim", "  ⋮")] + drop_blank_lead(rows[len(rows) - (budget - len(pin) - 1):])
+        else:
+            rows = rows[cut:]
+    rows = drop_blank_lead(rows)
+    when = local_stamp(stamp)
+    head = clip_cells("── recent conversation" + (f" · last message {when}" if when else "") + " ", width)
+    block = [("dim", head + "─" * (width - cells(head))), *rows, ("dim", "─" * width)]
+    sgr = {"bold": "\033[1m", "dim": "\033[2m"}
+    return [f"{sgr[style]}{text}\033[0m" if color and style in sgr and text else text for style, text in block]
+
+
+def show_recap(kind: str, uuid: str) -> None:
+    """Print the recap for a slept session (claude only: the other kinds keep no transcript we read)."""
+    path = transcript_for(uuid) if kind == "claude" else None
+    if path is None:
+        return
+    try:
+        budget = load_config()[0]["preview_lines"]
+    except Exception:  # a broken config disables sleeping (and says so); the stub keeps the default
+        budget = DEFAULTS["preview_lines"]
+    for line in recap_lines(path, budget, shutil.get_terminal_size((80, 24)).columns, color=sys.stdout.isatty()):
+        print(line)
+
+
 # ------------------------------------------------------------------- stub
 
 def stub_command(pane: str, uuid: str, slept_at: str) -> str:
@@ -1239,6 +1548,10 @@ def cmd_stub(pane: str, uuid: str, state_dir: str | None = None) -> int:
         return 0
     kind = entry.get("kind") or "claude"
     name = wake_name(entry)
+    try:
+        show_recap(kind, uuid)
+    except Exception as exc:  # a courtesy: it must never keep the stub from waiting for Enter
+        print(f"  (no conversation recap: {exc.__class__.__name__})")
     print(f"\n  {SLEEP_MARK}{entry.get('title') or name} — slept {entry.get('slept_at', '?')}")
     print("  press Enter to resume (ctrl-c leaves a plain shell)\n")
     while True:

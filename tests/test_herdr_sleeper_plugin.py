@@ -315,30 +315,33 @@ def test_load_config_precedence(state: Path, monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(sleeper, "CONFIG_FILE", cfg)
     for var in ("HERDR_SLEEPER_IDLE_HOURS", "HERDR_SLEEPER_IDLE", "HERDR_SLEEPER_EXCLUDE",
                 "HERDR_SLEEPER_AGENTS", "HERDR_SLEEPER_POLL_SECONDS", "HERDR_SLEEPER_NOTIFY",
-                "HERDR_SLEEPER_WAKE_ON_FOCUS"):
+                "HERDR_SLEEPER_WAKE_ON_FOCUS", "HERDR_SLEEPER_PREVIEW_LINES"):
         monkeypatch.delenv(var, raising=False)
     values, source = sleeper.load_config()
     assert values == {"idle_hours": 12.0, "agents": ["claude", "opencode"], "exclude": [],
-                      "poll_seconds": 60, "notify": True, "wake_on_focus": True}
+                      "poll_seconds": 60, "notify": True, "wake_on_focus": True, "preview_lines": 100}
     assert set(source.values()) == {"default"}
 
-    cfg.write_text('idle = "90m"\nexclude = "orc"\npoll_seconds = 30\nnotify = false\n')
+    cfg.write_text('idle = "90m"\nexclude = "orc"\npoll_seconds = 30\nnotify = false\npreview_lines = 40\n')
     values, source = sleeper.load_config()
     assert values["idle_hours"] == 1.5 and values["exclude"] == ["orc"]   # a string is one name, not letters
-    assert values["poll_seconds"] == 30 and values["notify"] is False
+    assert values["poll_seconds"] == 30 and values["notify"] is False and values["preview_lines"] == 40
     assert source["idle_hours"] == str(cfg)
 
     monkeypatch.setenv("HERDR_SLEEPER_IDLE", "2d")
     monkeypatch.setenv("HERDR_SLEEPER_EXCLUDE", "a b")
+    monkeypatch.setenv("HERDR_SLEEPER_PREVIEW_LINES", "0")
     values, source = sleeper.load_config()
-    assert values["idle_hours"] == 48 and values["exclude"] == ["a", "b"]
+    assert values["idle_hours"] == 48 and values["exclude"] == ["a", "b"] and values["preview_lines"] == 0
     assert source["idle_hours"] == "$HERDR_SLEEPER_IDLE"
 
 
 @pytest.mark.parametrize(
     "text",
     ["idle_hours = = 3\n", "idle_hours = nan\n", "idle_hours = -1\n", "exclude = [1, 2]\n", "poll_seconds = 0\n",
-     "bogus = 1\n", "idle_hours = false\n", "poll_seconds = true\n", 'agents = ["codex"]\n', "notify = 1\n"],
+     "bogus = 1\n", "idle_hours = false\n", "poll_seconds = true\n", 'agents = ["codex"]\n', "notify = 1\n",
+     "preview_lines = -1\n", "preview_lines = 1.5\n", "preview_lines = true\n", "preview_lines = 5000\n",
+     'preview_lines = "40"\n'],
 )
 def test_load_config_rejects_bad_values(state: Path, monkeypatch: pytest.MonkeyPatch, text: str) -> None:
     cfg = state / "config.toml"
@@ -1805,6 +1808,153 @@ def test_focus_delegated_to_the_stub_finishes_the_row(fake: FakeHerdr) -> None:
     focus_env("w1:p1")
     assert sleeper.cmd_on_focus() == 0
     assert journal() == {} and fake.agents[0]["name"] == "a"
+
+
+# ------------------------------------------------------------------ recap
+
+def tx(kind: str, uuid: str, parent: str | None, content: Any = None, **extra: Any) -> dict[str, Any]:
+    e: dict[str, Any] = {"type": kind, "uuid": uuid, "parentUuid": parent, "isSidechain": False,
+                         "timestamp": "2026-11-10T12:00:00.000Z", **extra}
+    if content is not None:
+        e["message"] = {"role": kind, "content": content}
+    return e
+
+
+def human(uuid: str, parent: str | None, text: str) -> dict[str, Any]:
+    return tx("user", uuid, parent, text, origin={"kind": "human"}, promptSource="typed")
+
+
+def write_transcript(root: Path, entries: list[dict[str, Any]], uuid: str = UUID) -> Path:
+    p = root / "projects" / "proj" / f"{uuid}.jsonl"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("".join(json.dumps(e, ensure_ascii=False) + "\n" for e in entries))
+    return p
+
+
+def test_recap_shows_the_conversation_and_drops_injected_context(state: Path) -> None:
+    p = write_transcript(state, [
+        human("u1", None, "fix the login bug"),
+        tx("assistant", "a1", "u1", [{"type": "thinking", "thinking": "secret plan"},
+                                     {"type": "text", "text": "Looking at it."}]),
+        tx("assistant", "a2", "a1", [{"type": "tool_use", "name": "Bash",
+                                      "input": {"command": "git status", "description": "Show status"}}]),
+        tx("user", "r1", "a2", [{"type": "tool_result", "content": "nothing to commit"}]),
+        tx("assistant", "t1", "r1", [{"type": "text", "text": "Now editing."}]),
+        tx("assistant", "a3", "t1", [{"type": "tool_use", "name": "Edit", "input": {"file_path": "/x/app/login.rb"}}]),
+        tx("assistant", "a4", "a3", [{"type": "tool_use", "name": "Edit", "input": {"file_path": "/x/app/session.rb"}}]),
+        tx("assistant", "a5", "a4", [{"type": "tool_use", "name": "Read", "input": {"file_path": "/x/README.md"}}]),
+        tx("user", "m1", "a5", "<local-command-caveat>Caveat: generated</local-command-caveat>", isMeta=True),
+        tx("user", "c1", "m1", "<command-name>/model</command-name>\n<command-message>model</command-message>\n"
+                               "<command-args>opus</command-args>"),
+        tx("user", "c2", "c1", "<local-command-stdout>Set model to opus</local-command-stdout>"),
+        tx("user", "n1", "c2", "<task-notification><task-id>t1</task-id></task-notification>",
+           origin={"kind": "task-notification"}),
+        tx("assistant", "a6", "n1", [{"type": "text", "text": "**Fixed** it.\x1b]52;c;ZXZpbA==\x07 Done.‮"}]),
+        {**tx("system", "s1", "a6", subtype="away_summary"), "content": "We fixed the login bug."},
+        {"type": "cost-state", "sessionId": UUID},   # metadata rows without a uuid trail the file
+    ])
+    lines = sleeper.recap_lines(p, 100, 80)
+    out = "\n".join(lines)
+    assert lines[0].startswith("── recent conversation · last message ") and set(lines[-1]) == {"─"}
+    assert "❯ fix the login bug" in out and "⏺ Looking at it." in out and "secret plan" not in out
+    assert "  ⎿ Bash: Show status" in out                      # one call: its description
+    assert "  ⎿ 3 tool calls: Edit ×2, Read" in out             # a run of calls (results between) is one row
+    assert "❯ /model opus" in out and "Set model" not in out and "Caveat" not in out
+    assert "task" not in out and "nothing to commit" not in out
+    assert "⏺ Fixed it. Done." in out and "\x1b" not in out and "‮" not in out
+    assert "※ We fixed the login bug." in out
+    assert all(sleeper.cells(line) <= 80 for line in lines)
+
+
+def test_recap_follows_the_current_branch_through_compaction(state: Path) -> None:
+    p = write_transcript(state, [
+        human("u1", None, "first question"),
+        tx("assistant", "a1", "u1", [{"type": "text", "text": "first answer"}]),
+        human("u2", "a1", "abandoned prompt"),                  # rewound: still in the file
+        tx("assistant", "a2", "u2", [{"type": "text", "text": "abandoned answer"}]),
+        human("u3", "a1", "rewritten prompt"),
+        tx("assistant", "a3", "u3", [{"type": "text", "text": "current answer"}]),
+        tx("system", "s1", None, subtype="compact_boundary", logicalParentUuid="a3"),
+        tx("user", "cs", "s1", "This session is being continued from a previous conversation...",
+           isCompactSummary=True),
+        human("u4", "cs", "after compaction"),
+        tx("assistant", "a4", "u4", [{"type": "text", "text": "final answer"}]),
+    ])
+    out = "\n".join(sleeper.recap_lines(p, 100, 80))
+    order = ["first question", "first answer", "rewritten prompt", "current answer", "conversation compacted",
+             "after compaction", "final answer"]
+    assert [out.index(s) for s in order] == sorted(out.index(s) for s in order)
+    assert "abandoned" not in out and "being continued" not in out
+
+
+def test_recap_budget_pins_the_last_prompt_and_fits_wide_text(state: Path) -> None:
+    p = write_transcript(state, [
+        human("u1", None, "한글로 된 긴 질문입니다 " * 20),
+        tx("assistant", "a1", "u1", [{"type": "text", "text": "\n".join(f"line {n}" for n in range(200))}]),
+    ])
+    lines = sleeper.recap_lines(p, 30, 30)
+    body = lines[1:-1]
+    assert len(body) <= 30 and all(sleeper.cells(line) <= 30 for line in lines)
+    assert body[0].startswith("❯ 한글로") and "  ⋮" in body   # the prompt stays above the cut
+    assert body[-1].endswith("line 199")                     # and the tail ends where the session did
+    small = sleeper.recap_lines(p, 10, 30)[1:-1]            # too small a budget to pin: the tail only
+    assert len(small) == 10 and "  ⋮" not in small and small[-1].endswith("line 199")
+    assert sleeper.recap_lines(p, 0, 30) == []
+
+
+def test_recap_reads_the_tail_in_growing_windows(state: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    p = write_transcript(state, [
+        human("u1", None, "the question"),
+        tx("assistant", "a1", "u1", [{"type": "text", "text": "x" * 500}]),
+        tx("assistant", "a2", "a1", [{"type": "text", "text": "short"}]),
+    ])
+    monkeypatch.setattr(sleeper, "RECAP_WINDOWS", (400,))   # starts mid-line in a1: that line is skipped
+    out = "\n".join(sleeper.recap_lines(p, 100, 80))
+    assert "⏺ short" in out and "the question" not in out
+    monkeypatch.setattr(sleeper, "RECAP_WINDOWS", (400, 1 << 20))   # no prompt yet: read further back
+    assert "❯ the question" in "\n".join(sleeper.recap_lines(p, 100, 80))
+
+
+def test_wrap_and_clean_count_terminal_cells() -> None:
+    assert sleeper.wrap_cells("the quick brown fox", 12, "", "") == ["the quick", "brown fox"]
+    assert sleeper.wrap_cells("가나다라마바사", 6, "", "") == ["가나다", "라마바", "사"]   # two cells each
+    assert sleeper.wrap_cells("가나다라", 6, "❯ ", "  ") == ["❯ 가나", "  다라"]
+    assert sleeper.wrap_cells("a\n\nb", 10, "⏺ ", "  ") == ["⏺ a", "", "  b"]
+    assert sleeper.clip_cells("가나다라", 5) == "가나…"
+    assert sleeper.clean_text("a\x1b[31mred\x1b[0m‮b\x07c\r\n\n\n\nd\t") == "aredbc\n\nd"
+    assert sleeper.clean_text("x\x1b]52;c;ZXZpbA==\x07y") == "xy"
+
+
+def test_stub_prints_the_recap_above_its_prompt(fake: FakeHerdr, state: Path, monkeypatch: pytest.MonkeyPatch,
+                                                capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.delenv("HERDR_SLEEPER_PREVIEW_LINES", raising=False)
+    stub_ready(fake, monkeypatch)
+    write_transcript(state, [human("u1", None, "hello there"),
+                             tx("assistant", "a1", "u1", [{"type": "text", "text": "hi"}])])
+    execs: list[str] = []
+    monkeypatch.setattr(sleeper.os, "execvp", lambda b, a: execs.append(b))
+    assert sleeper.cmd_stub("w1:p1", UUID) == 0 and execs == ["/opt/bin/claude"]
+    out = capsys.readouterr().out
+    assert out.index("recent conversation") < out.index("❯ hello there") < out.index("press Enter to resume")
+
+    monkeypatch.setenv("HERDR_SLEEPER_PREVIEW_LINES", "0")   # the stub reads the same config
+    stub_ready(fake, monkeypatch)
+    sleeper.cmd_stub("w1:p1", UUID)
+    assert "recent conversation" not in capsys.readouterr().out
+
+
+def test_stub_survives_a_failing_recap(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                       capsys: pytest.CaptureFixture[str]) -> None:
+    stub_ready(fake, monkeypatch)
+
+    def broken(*_a: Any, **_k: Any) -> list[str]:
+        raise RuntimeError("bad transcript")
+
+    monkeypatch.setattr(sleeper, "recap_lines", broken)
+    execs: list[str] = []
+    monkeypatch.setattr(sleeper.os, "execvp", lambda b, a: execs.append(b))
+    assert sleeper.cmd_stub("w1:p1", UUID) == 0 and execs == ["/opt/bin/claude"]   # still waits, still wakes
+    assert "no conversation recap: RuntimeError" in capsys.readouterr().out
 
 
 # --------------------------------------------- argv with nothing to replay

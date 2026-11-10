@@ -1,7 +1,8 @@
 # herdr-sleeper — sleep idle resumable agents, wake them later
 
 > Fork of [djbclark/herdr-sleeper](https://github.com/djbclark/herdr-sleeper)
-> that wakes agents whose argv had nothing to replay (plain `claude`, or Herdr's
+> that adds a conversation recap to the wake stub (`preview_lines`), and
+> wakes agents whose argv had nothing to replay (plain `claude`, or Herdr's
 > restored `claude --resume <id>`) instead of refusing them as unknown.
 
 A Herdr plugin that sleeps idle agent panes after a user-chosen window and
@@ -50,6 +51,18 @@ keeps the pane, reports a `sleeper` placeholder so the sidebar keeps its
 row, leaves a wake stub in the pane ("press Enter to resume"), prefixes the
 pane label with 💤, and posts a notification with the freed MB.
 
+The stub shows the tail of the session's conversation above its prompt, so a
+slept pane can be judged before it is woken: for claude, the last
+`preview_lines` rows (default 100, `0` turns it off) rebuilt from the
+transcript — prompts, replies, one row per run of tool calls, the time of the
+last message — fitted to the pane's width (wide CJK text counts two cells).
+It follows the current branch (a rewound branch is not shown) through
+compactions; when the budget cuts off the start of the last prompt, its first
+rows stay pinned above the tail. Thinking, tool output and injected context
+are left out, and escape sequences in the transcript are stripped before
+anything reaches the terminal. The recap is read-only and cosmetic: a
+transcript it cannot read costs the recap, never the stub.
+
 Wake paths:
 
 1. **Focus the pane** — the `pane.focused` hook wakes it (disable with
@@ -97,7 +110,8 @@ herdr plugin action invoke djbclark.herdr-sleeper.log
 Config: `<plugin config dir>/config.toml` — Herdr's
 `~/.config/herdr/plugins/config/djbclark.herdr-sleeper/config.toml` (run
 `herdr plugin list` to see it) — `idle` (duration), `agents` (list),
-`exclude` (panes or names), `poll_seconds`, `notify`, `wake_on_focus`;
+`exclude` (panes or names), `poll_seconds`, `notify`, `wake_on_focus`,
+`preview_lines` (0..1000);
 overridable by `HERDR_SLEEPER_*` env (booleans take true/false/1/0), lowest
 to highest precedence. State: `<plugin state dir>/` per Herdr session —
 `sleeping.json` journal, `panes.json` crash-recovery snapshot, `idle.json`
@@ -211,11 +225,12 @@ focus/command wakes only.
 
 ## Tests
 
-`python3 -m pytest tests/ -q` — 158 tests: the decision logic, the
+`python3 -m pytest tests/ -q` — 170 tests: the decision logic, the
 sleep/wake state machine, pane identity and orphans, the watcher tick and
-loop (idle clocks, backoff, the watcher lock), the focus hook, the stub,
-the 3.9 TOML subset parser, and legacy migration, against a fake `herdr`.
-Verified on Python 3.9 (Apple's `/usr/bin/python3`) and 3.14.
+loop (idle clocks, backoff, the watcher lock), the focus hook, the stub and
+its conversation recap, the 3.9 TOML subset parser, and legacy migration,
+against a fake `herdr`. Verified on Python 3.9 (Apple's `/usr/bin/python3`)
+and 3.15; upstream checked 3.14 before the recap existed.
 
 ## Credits
 
