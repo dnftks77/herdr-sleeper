@@ -1467,6 +1467,14 @@ def recap_rows(items: list[tuple[str, str, str]], width: int) -> tuple[list[tupl
     return rows, span
 
 
+def slept_label(entry: dict) -> str:
+    """When a row was slept, as `MM-DD HH:MM KST` (slept_at is this machine's local time, no zone)."""
+    try:
+        return dt.datetime.fromisoformat(str(entry.get("slept_at"))).astimezone().strftime("%m-%d %H:%M %Z")
+    except ValueError:
+        return str(entry.get("slept_at", "?"))
+
+
 def drop_blank_lead(rows: list[tuple[str, str]]) -> list[tuple[str, str]]:
     i = 0
     while i < len(rows) and not rows[i][1]:
@@ -1477,7 +1485,7 @@ def drop_blank_lead(rows: list[tuple[str, str]]) -> list[tuple[str, str]]:
 def local_stamp(stamp: str | None) -> str | None:
     """A transcript timestamp (UTC ISO) as local `MM-DD HH:MM`."""
     try:
-        return dt.datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).astimezone().strftime("%m-%d %H:%M")
+        return dt.datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).astimezone().strftime("%m-%d %H:%M %Z")
     except ValueError:
         return None
 
@@ -1624,12 +1632,12 @@ def cmd_stub(pane: str, uuid: str, state_dir: str | None = None) -> int:
         try:
             if clear:  # a resize: the recap was wrapped for the old width, so start over
                 print("\033[H\033[2J\033[3J", end="")
-            print(f"{SLEEP_MARK}slept by herdr-sleeper {entry.get('slept_at', '?')}")
+            print(f"{SLEEP_MARK}slept by herdr-sleeper {slept_label(entry)}")
             try:
                 show_recap(kind, uuid)
             except Exception as exc:  # a courtesy: it must never keep the stub from waiting for Enter
                 print(f"  (no conversation recap: {exc.__class__.__name__})")
-            print(f"\n  {SLEEP_MARK}{entry.get('title') or name} — slept {entry.get('slept_at', '?')}")
+            print(f"\n  {SLEEP_MARK}{entry.get('title') or name} — slept {slept_label(entry)}")
             print("  press Enter to resume (ctrl-c leaves a plain shell)\n", flush=True)
         finally:
             drawing["busy"] = False

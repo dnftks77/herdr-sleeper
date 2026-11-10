@@ -2218,3 +2218,15 @@ def test_the_stub_schedules_its_claim(fake: FakeHerdr, monkeypatch: pytest.Monke
     monkeypatch.setattr(sleeper.os, "execvp", lambda b, a: None)
     sleeper.cmd_stub("w1:p1", UUID)
     assert timers and timers[0][1] is sleeper.ensure_claimed and timers[0][2][0] == "w1:p1"
+
+
+def test_times_shown_in_the_stub_carry_the_local_zone(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TZ", "Asia/Seoul")
+    time.tzset()
+    try:
+        assert sleeper.slept_label({"slept_at": "2026-11-10T23:13:13"}) == "11-10 23:13 KST"
+        assert sleeper.local_stamp("2026-10-14T04:16:47.415Z") == "10-14 13:16 KST"
+        assert sleeper.slept_label({"slept_at": "garbage"}) == "garbage"
+    finally:
+        monkeypatch.delenv("TZ")
+        time.tzset()
