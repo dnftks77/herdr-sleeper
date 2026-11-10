@@ -121,6 +121,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 import unicodedata
@@ -1564,6 +1565,16 @@ def stub_command(pane: str, uuid: str) -> str:
             + shlex.join(["env", *env_args, str(SELF), "stub", pane, uuid, str(STATE_DIR)]))
 
 
+STUB_CLAIM_DELAY = 4.0   # seconds before a starting stub claims its pane (see cmd_stub)
+
+
+def ensure_claimed(pane: str, kind: str, entry: dict, uuid: str) -> None:
+    """Claim the pane for its stub unless our placeholder already holds it. Best effort."""
+    with contextlib.suppress(Exception):
+        if (herdr("pane", "get", pane, check=False).get("pane") or {}).get("agent") != CLAIM_AGENT:
+            claim(pane, kind, done=entry.get("status") == "done", uuid=uuid)
+
+
 def set_state_dir(state_dir: Path) -> None:
     """Point every state path at state_dir (the stub inherits no plugin env; the sleep side types it)."""
     global STATE_DIR, JOURNAL, SNAPSHOT, EVENTS, LOGFILE, LOCK, WATCHER_PID, WATCHER_LOCK, IDLE_FILE, NAMES_FILE
@@ -1624,6 +1635,13 @@ def cmd_stub(pane: str, uuid: str, state_dir: str | None = None) -> int:
             drawing["busy"] = False
 
     draw()
+    # After a Herdr restart the stub is started by its resume command and nothing holds the
+    # sidebar row until the watcher's next tick (a minute, longer while it backs off): claim it
+    # here. Delayed, because on the sleep path the exiting agent's session takes ~2s to drop and
+    # the sleeper claims right after; only an unclaimed pane is claimed.
+    timer = threading.Timer(STUB_CLAIM_DELAY, ensure_claimed, (pane, kind, entry, uuid))
+    timer.daemon = True  # never keeps a stub that is leaving (ctrl-c) waiting for it
+    timer.start()
     if sys.stdout.isatty() and hasattr(signal, "SIGWINCH"):
         # the pane is resized when another client attaches (a phone first, a laptop later): redraw
         # at the new width. exec resets the handler for the woken agent.

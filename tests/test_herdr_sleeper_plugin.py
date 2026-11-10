@@ -62,6 +62,9 @@ def state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     # never spawn a real watcher from a unit test; the heal path has its own tests
     monkeypatch.setattr(sleeper, "heal_watcher", lambda: None, raising=False)
     monkeypatch.setattr(sleeper, "RESUME_REGISTERED", set(), raising=False)
+    # a stub's delayed self-claim must not fire into a later test's fake
+    monkeypatch.setattr(sleeper.threading, "Timer",
+                        lambda *a, **k: types.SimpleNamespace(start=lambda: None, daemon=True))
     if hasattr(sleeper, "STOP"):
         monkeypatch.setitem(sleeper.STOP, "requested", False)
     for var in ("HERDR_PLUGIN_CONTEXT_JSON", "HERDR_PANE_ID", "HERDR_PLUGIN_EVENT_JSON"):
@@ -2182,3 +2185,36 @@ def test_sleep_marks_and_unnamed_panes_are_left_alone(fake: FakeHerdr) -> None:
     named(fake, None, "Title")
     sleeper.sync_names(fake.agents)
     assert prompts(fake) == []
+
+
+# --------------------------------------------- stub claims its row on restart
+
+def test_a_stub_started_without_a_claim_claims_its_pane(fake: FakeHerdr) -> None:
+    """After a restart Herdr starts the stub from the resume command and nothing holds the row."""
+    entry = slept_entry(fake)
+    fake.agents[0].pop("agent", None)          # the restart dropped every claim
+    fake.resume.clear()
+    sleeper.ensure_claimed("w1:p1", "claude", entry, UUID)
+    assert fake.agents[0]["agent"] == sleeper.CLAIM_AGENT and fake.resume["w1:p1"][2:4] == ["stub", "w1:p1"]
+    before = len(fake.calls)
+    sleeper.ensure_claimed("w1:p1", "claude", entry, UUID)   # already ours: one look, no report
+    assert [c[:2] for c in fake.calls[before:]] == [("pane", "get")]
+
+
+def test_the_stub_schedules_its_claim(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    stub_ready(fake, monkeypatch)
+    timers: list[tuple] = []
+
+    class Timer:
+        def __init__(self, delay: float, fn: Any, args: tuple) -> None:
+            timers.append((delay, fn, args))
+
+        daemon = False
+
+        def start(self) -> None:
+            assert self.daemon
+
+    monkeypatch.setattr(sleeper.threading, "Timer", Timer)
+    monkeypatch.setattr(sleeper.os, "execvp", lambda b, a: None)
+    sleeper.cmd_stub("w1:p1", UUID)
+    assert timers and timers[0][1] is sleeper.ensure_claimed and timers[0][2][0] == "w1:p1"
