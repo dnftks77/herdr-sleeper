@@ -15,6 +15,8 @@ unchanged, and the plugin adds what only a plugin can do:
   * the stub shows the tail of the session's conversation above its wake
     prompt (claude, from the transcript; `preview_lines`), so a slept pane
     can be judged before it is woken
+  * the claim carries the stub as the pane's resume command, so a Herdr
+    server restart brings the stub back instead of a bare shell
 
 Exit path per agent kind: SIGTERM for claude and opencode (both shut down
 cleanly; a draft in the composer is discarded, never submitted — this is why
@@ -1022,16 +1024,37 @@ def recheck(agent: dict, idle_hours: float, journal: dict, exclude: set[str],
 
 # ----------------------------------------------------------------- sidebar
 
-def claim(pane: str, kind: str, done: bool = False) -> bool:
+def stub_resume_argv(pane: str, uuid: str) -> list[str] | None:
+    """What Herdr runs in this pane after a server restart: the stub again, recap and all.
+
+    Herdr's rules for a resume command (docs/add-herdr-support): a plain command name first,
+    no apostrophe or control character in any argument, at most 64 arguments and 8 KiB.
+    None when a path breaks them — the pane then comes back as a bare shell, as before.
+    """
+    argv = ["python3", str(SELF), "stub", pane, uuid, str(STATE_DIR)]
+    if any("'" in a or any(ord(c) < 32 or ord(c) == 127 for c in a) for a in argv) or len(" ".join(argv)) > 8192:
+        return None
+    return argv
+
+
+def claim(pane: str, kind: str, done: bool = False, uuid: str | None = None) -> bool:
     """Keep the slept pane's sidebar row: report a placeholder agent we own. Best effort.
 
     `done` (finished, unviewed) is carried into the label so sleeping does not hide that cue.
+    With the session's uuid, the claim also carries the stub's resume command, so a Herdr
+    restart brings the stub back instead of a bare shell. It is a separate report: a resume
+    command Herdr refuses must not cost the claim. Releasing the claim clears it.
     """
     with contextlib.suppress(SleeperError):
         herdr("pane", "report-agent", pane, "--source", CLAIM_SOURCE, "--agent", CLAIM_AGENT,
               "--state", "unknown", check=False)
         herdr("pane", "report-metadata", pane, "--source", "herdr-sleeper",
               "--display-agent", f"{kind} · sleeping" + (" · done" if done else ""), check=False)
+        resume = stub_resume_argv(pane, uuid) if uuid else None
+        if resume:
+            with contextlib.suppress(SleeperError):  # refused (resume off, older Herdr): the claim stands
+                herdr("pane", "report-agent-session", pane, "--source", CLAIM_SOURCE, "--agent", CLAIM_AGENT,
+                      "--", *resume, check=False)
         return herdr("pane", "get", pane, check=False).get("pane", {}).get("agent") == CLAIM_AGENT
     return False
 
@@ -1183,10 +1206,10 @@ def sleep_agent(agent: dict, idle_hours: float, exclude: set[str], dry_run: bool
     #    The stub runs as a child of the pane's shell (no `exec` — the shell must survive beneath
     #    it, or the pane would close when the woken agent exits). The pane shell has none of the
     #    plugin env, so the typed command carries the stub's own routing (see stub_command).
-    herdr("pane", "run", pane, stub_command(pane, uuid, entry["slept_at"]), check=False)
+    herdr("pane", "run", pane, stub_command(pane, uuid), check=False)
     herdr("pane", "rename", pane, SLEEP_MARK + (label or entry["title"] or name), check=False)
     time.sleep(2)  # herdr takes ~2s to drop the exited agent's session; the claim is ignored before that
-    claim(pane, kind, done=entry["status"] == "done")
+    claim(pane, kind, done=entry["status"] == "done", uuid=uuid)
     event("slept", pane=pane, name=name, uuid=uuid, kind=kind, title=entry["title"], cwd=entry["cwd"],
           freed_mb=freed_mb or None, how=how)
     notify(f"{SLEEP_MARK}slept {name}", f"freed ~{freed_mb} MB · wake: focus the pane, press Enter, or "
@@ -1201,6 +1224,7 @@ def sleep_agent(agent: dict, idle_hours: float, exclude: set[str], dry_run: bool
 # anything that goes wrong costs the recap, never the stub.
 RECAP_WINDOWS = (1 << 20, 4 << 20, 16 << 20)  # tail bytes read in turn; transcripts reach tens of MB
 RECAP_PIN_ROWS = 6        # rows of the last prompt kept above the tail when the tail alone would cut it off
+RECAP_PROMPT_SGR = "\033[1;97;48;5;237m"  # bold bright white on dark grey (256-colour: tmux/mosh-safe)
 RECAP_TOOL_KEYS = ("description", "command", "file_path", "path", "pattern", "url", "query", "skill", "prompt")
 # Transcript text must not drive the pane's terminal: escape sequences, C0/C1 controls (newline
 # excepted) and bidi overrides that would reorder what is shown are dropped.
@@ -1415,7 +1439,7 @@ def recap_rows(items: list[tuple[str, str, str]], width: int) -> tuple[list[tupl
             if rows:
                 rows.append(("", ""))
             start = len(rows)
-            rows.extend(("bold", r) for r in wrap_cells(text, width, "❯ ", "  "))
+            rows.extend(("prompt", r) for r in wrap_cells(text, width, "❯ ", "  "))
             span = (start, len(rows))
         elif kind == "assistant":
             text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)  # bold markers are noise without a renderer
@@ -1474,8 +1498,17 @@ def recap_lines(path: Path, budget: int, width: int, color: bool = False) -> lis
     when = local_stamp(stamp)
     head = clip_cells("── recent conversation" + (f" · last message {when}" if when else "") + " ", width)
     block = [("dim", head + "─" * (width - cells(head))), *rows, ("dim", "─" * width)]
-    sgr = {"bold": "\033[1m", "dim": "\033[2m"}
-    return [f"{sgr[style]}{text}\033[0m" if color and style in sgr and text else text for style, text in block]
+    if not color:
+        return [text for _style, text in block]
+    out = []
+    for style, text in block:
+        if style == "prompt":  # a band across the pane: what was asked stands apart from the replies
+            out.append(f"{RECAP_PROMPT_SGR}{text}{' ' * max(0, width - 1 - cells(text))}\033[0m")
+        elif style == "dim" and text:
+            out.append(f"\033[2m{text}\033[0m")
+        else:
+            out.append(text)
+    return out
 
 
 def show_recap(kind: str, uuid: str) -> None:
@@ -1487,14 +1520,15 @@ def show_recap(kind: str, uuid: str) -> None:
         budget = load_config()[0]["preview_lines"]
     except Exception:  # a broken config disables sleeping (and says so); the stub keeps the default
         budget = DEFAULTS["preview_lines"]
-    for line in recap_lines(path, budget, shutil.get_terminal_size((80, 24)).columns, color=sys.stdout.isatty()):
+    color = sys.stdout.isatty() and "NO_COLOR" not in os.environ
+    for line in recap_lines(path, budget, shutil.get_terminal_size((80, 24)).columns, color=color):
         print(line)
 
 
 # ------------------------------------------------------------------- stub
 
-def stub_command(pane: str, uuid: str, slept_at: str) -> str:
-    """The line typed into a slept pane's shell: reset modes, a banner, then the wake stub.
+def stub_command(pane: str, uuid: str) -> str:
+    """The line typed into a slept pane's shell: reset modes, clear, then the wake stub (which prints the banner).
 
     POSIX-shell text with no control bytes (escapes are printf's), and `env` for the
     routing — the session's socket, the herdr binary, the session name — so it does not
@@ -1504,8 +1538,7 @@ def stub_command(pane: str, uuid: str, slept_at: str) -> str:
     """
     env_args = [f"{var}={os.environ[var]}" for var in ("HERDR_SOCKET_PATH", "HERDR_BIN_PATH") if os.environ.get(var)]
     env_args.append(f"HERDR_SESSION={SESSION}")
-    banner = SLEEP_MARK + "slept by herdr-sleeper " + slept_at
-    return (f"printf '{MODE_RESET_PRINTF}'; clear; printf '%s\\n' {shlex.quote(banner)}; "
+    return (f"printf '{MODE_RESET_PRINTF}'; clear; "
             + shlex.join(["env", *env_args, str(SELF), "stub", pane, uuid, str(STATE_DIR)]))
 
 
@@ -1548,6 +1581,7 @@ def cmd_stub(pane: str, uuid: str, state_dir: str | None = None) -> int:
         return 0
     kind = entry.get("kind") or "claude"
     name = wake_name(entry)
+    print(f"{SLEEP_MARK}slept by herdr-sleeper {entry.get('slept_at', '?')}")
     try:
         show_recap(kind, uuid)
     except Exception as exc:  # a courtesy: it must never keep the stub from waiting for Enter
@@ -1614,7 +1648,7 @@ def cmd_stub(pane: str, uuid: str, state_dir: str | None = None) -> int:
             journal = read_json(JOURNAL)
             put_back(journal, pane, cur, f"stub could not start {binary}: {exc!r}")
             write_json(JOURNAL, journal)
-        claim(pane, kind, done=cur.get("status") == "done")
+        claim(pane, kind, done=cur.get("status") == "done", uuid=uuid)
         herdr("pane", "rename", pane, SLEEP_MARK + (cur.get("label") or cur.get("title") or name), check=False)
         event("wake-failed", pane=pane, name=name, uuid=uuid, via="stub", reason=repr(exc))
         print(f"herdr-sleeper: could not start {binary} ({exc!r}); left asleep.\n  manual: {manual_command(cur)}")
@@ -1974,7 +2008,7 @@ def reconcile(agents: list[dict]) -> None:
             elif not live and waking_alive(entry) is False:
                 put_back(journal, pane, entry, "the waking stub exited before its session appeared")
                 changed = True
-                claim(pane, kind, done=entry.get("status") == "done")
+                claim(pane, kind, done=entry.get("status") == "done", uuid=entry["uuid"])
                 event("reconciled", pane=pane, name=wake_name(entry), uuid=entry["uuid"], outcome="asleep-again")
             continue
         confirmed_running = bool(live and live_uuid == entry["uuid"] and agent_process(pane, kind)[0] is True)
@@ -2025,8 +2059,27 @@ def reconcile(agents: list[dict]) -> None:
                 orphan_entry(journal, pane, f"pane id now belongs to terminal {panes[pane].get('terminal_id')} "
                                             f"in {panes[pane].get('cwd')}")
                 changed = True
+        if journal.get(pane) is entry and entry.get("phase", "asleep") == "asleep":
+            register_resume(pane, entry)
     if changed:
         write_json(JOURNAL, journal)
+
+
+RESUME_REGISTERED: set[tuple[str, str]] = set()  # (pane, uuid) this watcher re-claimed with the stub's resume
+
+
+def register_resume(pane: str, entry: dict) -> None:
+    """Re-claim a pane whose stub is running, once per watcher.
+
+    A row slept before claims carried the resume command gets it; after a Herdr restart (which
+    runs the stub from that command, but keeps no display metadata) the `<kind> · sleeping`
+    sidebar label comes back.
+    """
+    key = (pane, entry["uuid"])
+    if key in RESUME_REGISTERED or stub_running(pane, entry["uuid"]) is not True:
+        return
+    claim(pane, entry["kind"], done=entry.get("status") == "done", uuid=entry["uuid"])
+    RESUME_REGISTERED.add(key)
 
 
 # ---------------------------------------------------------------- watcher

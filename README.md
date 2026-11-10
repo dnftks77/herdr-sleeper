@@ -61,7 +61,22 @@ compactions; when the budget cuts off the start of the last prompt, its first
 rows stay pinned above the tail. Thinking, tool output and injected context
 are left out, and escape sequences in the transcript are stripped before
 anything reaches the terminal. The recap is read-only and cosmetic: a
-transcript it cannot read costs the recap, never the stub.
+transcript it cannot read costs the recap, never the stub. Prompts are
+drawn as a dark band across the pane (bold white on 256-colour grey; plain
+when stdout is not a terminal or `NO_COLOR` is set), so what was asked stands
+apart from the replies.
+
+The stub survives a Herdr server restart. The sidebar claim carries it as
+the pane's resume command (Herdr 0.9.2+), so once a client attaches Herdr
+runs the stub again in the restored pane — banner, recap and Enter-to-resume
+included — instead of leaving a bare shell. Leaving the stub (Enter, or
+ctrl-c for a plain shell) releases the claim and with it the resume command,
+so a pane left as a plain shell stays one. Each watcher re-claims the running
+stubs once: panes slept by an older version get the resume command, and after
+a restart the `<kind> · sleeping` label comes back. With
+`[session] resume_agents_on_restore = false`, or a path Herdr refuses (an
+apostrophe), the pane comes back as a bare shell as before; focus or `wake`
+still resume it.
 
 Wake paths:
 
@@ -225,10 +240,10 @@ focus/command wakes only.
 
 ## Tests
 
-`python3 -m pytest tests/ -q` — 170 tests: the decision logic, the
+`python3 -m pytest tests/ -q` — 177 tests: the decision logic, the
 sleep/wake state machine, pane identity and orphans, the watcher tick and
 loop (idle clocks, backoff, the watcher lock), the focus hook, the stub and
-its conversation recap, the 3.9 TOML subset parser, and legacy migration,
+its conversation recap and restart resume command, the 3.9 TOML subset parser, and legacy migration,
 against a fake `herdr`. Verified on Python 3.9 (Apple's `/usr/bin/python3`)
 and 3.15; upstream checked 3.14 before the recap existed.
 

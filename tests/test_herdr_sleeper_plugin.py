@@ -61,6 +61,7 @@ def state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(sleeper, "LEGACY_CONFIG_FILES", [tmp_path / "legacy-config.toml"], raising=False)
     # never spawn a real watcher from a unit test; the heal path has its own tests
     monkeypatch.setattr(sleeper, "heal_watcher", lambda: None, raising=False)
+    monkeypatch.setattr(sleeper, "RESUME_REGISTERED", set(), raising=False)
     if hasattr(sleeper, "STOP"):
         monkeypatch.setitem(sleeper.STOP, "requested", False)
     for var in ("HERDR_PLUGIN_CONTEXT_JSON", "HERDR_PANE_ID", "HERDR_PLUGIN_EVENT_JSON"):
@@ -107,6 +108,7 @@ class FakeHerdr:
         self.empty_foreground = False       # process-info answers with [] (Herdr could not see the job)
         self.signals: list[tuple[int, int]] = []
         self.execvps: list[tuple[str, list[str]]] = []
+        self.resume: dict[str, list[str]] = {}   # pane -> resume command the claim holder reported
 
     def kill(self, pid: int, sig: int) -> None:
         self.signals.append((pid, sig))
@@ -188,6 +190,12 @@ class FakeHerdr:
             a = by_pane[args[2]]
             if a.get("agent") == sleeper.CLAIM_AGENT:
                 a.pop("agent", None)
+            self.resume.pop(args[2], None)   # releasing clears the source's resume command too
+            return {}
+        if args[:2] == ("pane", "report-agent-session"):
+            if by_pane[args[2]].get("agent") != sleeper.CLAIM_AGENT:
+                raise sleeper.SleeperError("resume_not_accepted")  # the source must hold the pane first
+            self.resume[args[2]] = list(args[args.index("--") + 1:])
             return {}
         if args[:2] in (("pane", "run"), ("pane", "rename"), ("pane", "report-metadata"),
                         ("pane", "send-keys"), ("notification", "show"), ("agent", "prompt")):
@@ -1975,3 +1983,69 @@ def test_a_known_empty_argv_still_wakes(fake: FakeHerdr, monkeypatch: pytest.Mon
     assert sleeper.wake_entry(entry)
     start = next(c for c in fake.calls if c[:2] == ("agent", "start"))
     assert start[-2:] == ("--resume", UUID) and "--dangerously-skip-permissions" not in start
+
+
+# ------------------------------------------------- stub across a Herdr restart
+
+def test_the_claim_carries_the_stub_as_its_resume_command(fake: FakeHerdr) -> None:
+    """Herdr runs a claim's resume command in the restored pane: the stub comes back, not a bare shell."""
+    slept_entry(fake)
+    assert fake.resume["w1:p1"] == ["python3", str(sleeper.SELF), "stub", "w1:p1", UUID, str(sleeper.STATE_DIR)]
+    assert sleeper.stub_argv_index(fake.resume["w1:p1"]) is not None   # what stub_running recognises
+
+
+@pytest.mark.parametrize("lines", [[""], None])   # Enter wakes; ctrl-c leaves a plain shell
+def test_leaving_the_stub_clears_the_resume_command(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                                    lines: list[str] | None) -> None:
+    stub_ready(fake, monkeypatch, lines)
+    if lines is None:
+        monkeypatch.setattr("builtins.input", lambda _prompt="": (_ for _ in ()).throw(KeyboardInterrupt()))
+    monkeypatch.setattr(sleeper.os, "execvp", lambda b, a: None)
+    assert "w1:p1" in fake.resume
+    sleeper.cmd_stub("w1:p1", UUID)
+    assert "w1:p1" not in fake.resume   # a restart must not bring back a stub the user left
+
+
+def test_reconcile_registers_the_resume_command_once_for_a_running_stub(fake: FakeHerdr) -> None:
+    """Rows slept before claims carried it get it; after a restart the sidebar label comes back."""
+    slept_entry(fake)
+    fake.resume.clear()
+    fake.stub_panes.add("w1:p1")
+    sleeper.reconcile(fake.agents)
+    sleeper.reconcile(fake.agents)
+    assert fake.resume["w1:p1"][2:4] == ["stub", "w1:p1"]
+    assert sum(1 for c in fake.calls if c[:2] == ("pane", "report-agent-session")) == 2   # sleep + one re-claim
+    fake.stub_panes.discard("w1:p1")
+    sleeper.RESUME_REGISTERED.clear()
+    sleeper.reconcile(fake.agents)                    # no stub running there: nothing to register
+    assert sum(1 for c in fake.calls if c[:2] == ("pane", "report-agent-session")) == 2
+
+
+def test_resume_command_follows_herdrs_rules(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sleeper, "SELF", Path("/opt/it's here/herdr-sleeper"))   # an apostrophe: Herdr refuses it
+    assert sleeper.stub_resume_argv("w1:p1", UUID) is None
+    slept_entry(fake)
+    assert "w1:p1" not in fake.resume and fake.agents[0]["agent"] == sleeper.CLAIM_AGENT   # the claim stands
+
+
+def test_stub_prints_its_banner_itself(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                       capsys: pytest.CaptureFixture[str]) -> None:
+    """A stub Herdr restarts from the resume command has no typed printf before it."""
+    stub_ready(fake, monkeypatch)
+    monkeypatch.setattr(sleeper.os, "execvp", lambda b, a: None)
+    sleeper.cmd_stub("w1:p1", UUID)
+    assert capsys.readouterr().out.startswith("💤 slept by herdr-sleeper ")
+    assert "slept by" not in stub_run(fake)
+
+
+def test_recap_prompt_rows_are_a_band(state: Path) -> None:
+    p = write_transcript(state, [human("u1", None, "한글 프롬프트 " * 8),
+                                 tx("assistant", "a1", "u1", [{"type": "text", "text": "the reply"}])])
+    lines = sleeper.recap_lines(p, 100, 40, color=True)
+    plain = [sleeper.ESCAPE_RE.sub("", line) for line in lines]
+    prompt = [i for i, line in enumerate(plain) if line.startswith("❯ ")]
+    assert prompt and all(lines[i].startswith(sleeper.RECAP_PROMPT_SGR) for i in range(prompt[0], prompt[0] + 2))
+    assert all(sleeper.cells(plain[i]) == 39 for i in range(prompt[0], prompt[0] + 2))   # padded across the pane
+    reply = next(i for i, line in enumerate(plain) if line.startswith("⏺ "))
+    assert lines[reply] == plain[reply]                                                  # replies stay plain
+    assert sleeper.recap_lines(p, 100, 40) == plain[:1] + [l.rstrip() for l in plain[1:-1]] + plain[-1:]
