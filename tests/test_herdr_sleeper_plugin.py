@@ -2064,3 +2064,47 @@ def test_a_watcher_that_outlives_a_restart_claims_the_restored_stub_again(fake: 
     fake.agents[0].pop("agent", None)                # Herdr kept no claim across the restart
     sleeper.reconcile(fake.agents)
     assert calls() == before + 1 and fake.agents[0]["agent"] == sleeper.CLAIM_AGENT
+
+
+# ------------------------------------------------------ stub redraw on resize
+
+def test_stub_redraws_the_recap_at_the_new_width_on_resize(fake: FakeHerdr, state: Path,
+                                                           monkeypatch: pytest.MonkeyPatch,
+                                                           capsys: pytest.CaptureFixture[str]) -> None:
+    """A phone attaching first leaves the pane narrow; the laptop widening it later must not leave
+    the recap wrapped at the phone's width."""
+    monkeypatch.delenv("HERDR_SLEEPER_PREVIEW_LINES", raising=False)
+    stub_ready(fake, monkeypatch)
+    write_transcript(state, [human("u1", None, "hello"), tx("assistant", "a1", "u1", [{"type": "text", "text": "hi"}])])
+    widths = iter([30, 90])
+    monkeypatch.setattr(sleeper, "terminal_width", lambda: next(widths))
+    monkeypatch.setattr(sleeper.sys.stdout, "isatty", lambda: True)
+    handlers: dict[int, Any] = {}
+    monkeypatch.setattr(sleeper.signal, "signal", lambda sig, h: handlers.__setitem__(sig, h))
+
+    def resize_then_enter(_prompt: str = "") -> str:
+        handlers[sleeper.signal.SIGWINCH](sleeper.signal.SIGWINCH, None)
+        return ""
+
+    monkeypatch.setattr("builtins.input", resize_then_enter)
+    monkeypatch.setattr(sleeper.os, "execvp", lambda b, a: None)
+    sleeper.cmd_stub("w1:p1", UUID)
+    out = capsys.readouterr().out
+    first, _, redrawn = out.partition("\033[H\033[2J\033[3J")
+    footer = lambda text: max((len(sleeper.ESCAPE_RE.sub("", l)) for l in text.splitlines() if set(sleeper.ESCAPE_RE.sub("", l)) == {"─"}), default=0)
+    assert redrawn and footer(first) == 30 and footer(redrawn) == 90
+    assert redrawn.count("press Enter to resume") == 1
+
+
+def test_transcript_tail_is_read_once_until_the_file_changes(state: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    p = write_transcript(state, [human("u1", None, "hello")])
+    reads: list[int] = []
+    real = sleeper._read_tail
+    monkeypatch.setattr(sleeper, "_read_tail", lambda path, window: reads.append(window) or real(path, window))
+    sleeper.TAIL_CACHE.clear()
+    sleeper.transcript_tail(p, 1 << 20)
+    sleeper.transcript_tail(p, 1 << 20)
+    assert len(reads) == 1
+    write_transcript(state, [human("u1", None, "hello"), human("u2", "u1", "again")])
+    sleeper.transcript_tail(p, 1 << 20)
+    assert len(reads) == 2

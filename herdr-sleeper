@@ -1331,8 +1331,20 @@ def tool_label(block: dict) -> tuple[str, str]:
     return name, ""
 
 
+TAIL_CACHE: dict[tuple, tuple[list[dict], bool]] = {}  # a slept transcript does not change; resizes re-read it
+
+
 def transcript_tail(path: Path, window: int) -> tuple[list[dict], bool]:
     """The entries in the last `window` bytes of a transcript, and whether that was all of it."""
+    st = path.stat()
+    key = (str(path), window, st.st_size, st.st_mtime_ns)
+    if key not in TAIL_CACHE:
+        TAIL_CACHE.clear()
+        TAIL_CACHE[key] = _read_tail(path, window)
+    return TAIL_CACHE[key]
+
+
+def _read_tail(path: Path, window: int) -> tuple[list[dict], bool]:
     with path.open("rb") as fh:
         size = fh.seek(0, os.SEEK_END)
         start = max(0, size - window)
@@ -1521,8 +1533,16 @@ def show_recap(kind: str, uuid: str) -> None:
     except Exception:  # a broken config disables sleeping (and says so); the stub keeps the default
         budget = DEFAULTS["preview_lines"]
     color = sys.stdout.isatty() and "NO_COLOR" not in os.environ
-    for line in recap_lines(path, budget, shutil.get_terminal_size((80, 24)).columns, color=color):
+    for line in recap_lines(path, budget, terminal_width(), color=color):
         print(line)
+
+
+def terminal_width() -> int:
+    """The pane's width now (the tty, not $COLUMNS, which a shell may have frozen)."""
+    try:
+        return os.get_terminal_size(sys.stdout.fileno()).columns
+    except (OSError, ValueError):
+        return shutil.get_terminal_size((80, 24)).columns
 
 
 # ------------------------------------------------------------------- stub
@@ -1581,13 +1601,30 @@ def cmd_stub(pane: str, uuid: str, state_dir: str | None = None) -> int:
         return 0
     kind = entry.get("kind") or "claude"
     name = wake_name(entry)
-    print(f"{SLEEP_MARK}slept by herdr-sleeper {entry.get('slept_at', '?')}")
-    try:
-        show_recap(kind, uuid)
-    except Exception as exc:  # a courtesy: it must never keep the stub from waiting for Enter
-        print(f"  (no conversation recap: {exc.__class__.__name__})")
-    print(f"\n  {SLEEP_MARK}{entry.get('title') or name} — slept {entry.get('slept_at', '?')}")
-    print("  press Enter to resume (ctrl-c leaves a plain shell)\n")
+    drawing = {"busy": False}
+
+    def draw(clear: bool = False) -> None:
+        if drawing["busy"]:
+            return
+        drawing["busy"] = True
+        try:
+            if clear:  # a resize: the recap was wrapped for the old width, so start over
+                print("\033[H\033[2J\033[3J", end="")
+            print(f"{SLEEP_MARK}slept by herdr-sleeper {entry.get('slept_at', '?')}")
+            try:
+                show_recap(kind, uuid)
+            except Exception as exc:  # a courtesy: it must never keep the stub from waiting for Enter
+                print(f"  (no conversation recap: {exc.__class__.__name__})")
+            print(f"\n  {SLEEP_MARK}{entry.get('title') or name} — slept {entry.get('slept_at', '?')}")
+            print("  press Enter to resume (ctrl-c leaves a plain shell)\n", flush=True)
+        finally:
+            drawing["busy"] = False
+
+    draw()
+    if sys.stdout.isatty() and hasattr(signal, "SIGWINCH"):
+        # the pane is resized when another client attaches (a phone first, a laptop later): redraw
+        # at the new width. exec resets the handler for the woken agent.
+        signal.signal(signal.SIGWINCH, lambda *_a: draw(clear=True))
     while True:
         try:
             line = input()

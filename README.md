@@ -64,7 +64,9 @@ anything reaches the terminal. The recap is read-only and cosmetic: a
 transcript it cannot read costs the recap, never the stub. Prompts are
 drawn as a dark band across the pane (bold white on 256-colour grey; plain
 when stdout is not a terminal or `NO_COLOR` is set), so what was asked stands
-apart from the replies.
+apart from the replies. The stub redraws on a resize (a pane starts narrow when
+a phone attaches first and widens when a laptop joins), so the recap always
+fills the pane's current width; the transcript is read once and cached.
 
 The stub survives a Herdr server restart. The sidebar claim carries it as
 the pane's resume command (Herdr 0.9.2+), so once a client attaches Herdr
@@ -240,7 +242,7 @@ focus/command wakes only.
 
 ## Tests
 
-`python3 -m pytest tests/ -q` — 178 tests: the decision logic, the
+`python3 -m pytest tests/ -q` — 180 tests: the decision logic, the
 sleep/wake state machine, pane identity and orphans, the watcher tick and
 loop (idle clocks, backoff, the watcher lock), the focus hook, the stub and
 its conversation recap and restart resume command, the 3.9 TOML subset parser, and legacy migration,
