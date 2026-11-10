@@ -2049,3 +2049,18 @@ def test_recap_prompt_rows_are_a_band(state: Path) -> None:
     reply = next(i for i, line in enumerate(plain) if line.startswith("⏺ "))
     assert lines[reply] == plain[reply]                                                  # replies stay plain
     assert sleeper.recap_lines(p, 100, 40) == plain[:1] + [l.rstrip() for l in plain[1:-1]] + plain[-1:]
+
+
+def test_a_watcher_that_outlives_a_restart_claims_the_restored_stub_again(fake: FakeHerdr) -> None:
+    """The restart re-allocates terminal ids; a surviving watcher must not treat the pane as done."""
+    slept_entry(fake)
+    fake.stub_panes.add("w1:p1")
+    sleeper.reconcile(fake.agents)
+    calls = lambda: sum(1 for c in fake.calls if c[:2] == ("pane", "report-agent-session"))
+    before = calls()
+    sleeper.reconcile(fake.agents)
+    assert calls() == before                         # same terminal: once is enough
+    fake.agents[0].update(terminal_id="term-restored", label=sleeper.SLEEP_MARK + "Title")
+    fake.agents[0].pop("agent", None)                # Herdr kept no claim across the restart
+    sleeper.reconcile(fake.agents)
+    assert calls() == before + 1 and fake.agents[0]["agent"] == sleeper.CLAIM_AGENT

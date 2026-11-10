@@ -2060,22 +2060,23 @@ def reconcile(agents: list[dict]) -> None:
                                             f"in {panes[pane].get('cwd')}")
                 changed = True
         if journal.get(pane) is entry and entry.get("phase", "asleep") == "asleep":
-            register_resume(pane, entry)
+            register_resume(pane, entry, (panes.get(pane) or {}).get("terminal_id"))
     if changed:
         write_json(JOURNAL, journal)
 
 
-RESUME_REGISTERED: set[tuple[str, str]] = set()  # (pane, uuid) this watcher re-claimed with the stub's resume
+RESUME_REGISTERED: set[tuple] = set()  # (pane, uuid, terminal) this watcher re-claimed with the stub's resume
 
 
-def register_resume(pane: str, entry: dict) -> None:
-    """Re-claim a pane whose stub is running, once per watcher.
+def register_resume(pane: str, entry: dict, terminal: str | None = None) -> None:
+    """Re-claim a pane whose stub is running, once per watcher and terminal.
 
     A row slept before claims carried the resume command gets it; after a Herdr restart (which
     runs the stub from that command, but keeps no display metadata) the `<kind> · sleeping`
-    sidebar label comes back.
+    sidebar label comes back. The terminal id is part of the key because a watcher can outlive
+    the server: the restart re-allocates terminal ids, so the restored stub is claimed again.
     """
-    key = (pane, entry["uuid"])
+    key = (pane, entry["uuid"], terminal)
     if key in RESUME_REGISTERED or stub_running(pane, entry["uuid"]) is not True:
         return
     claim(pane, entry["kind"], done=entry.get("status") == "done", uuid=entry["uuid"])
