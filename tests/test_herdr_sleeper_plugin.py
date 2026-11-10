@@ -2307,3 +2307,59 @@ def test_process_elapsed_parses_ps_etime(monkeypatch: pytest.MonkeyPatch) -> Non
     for out, secs in (("05:03", 303), ("1:02:03", 3723), ("2-01:00:00", 176400)):
         monkeypatch.setattr(sleeper.subprocess, "run", lambda *a, _o=out, **k: types.SimpleNamespace(stdout=_o + "\n"))
         assert sleeper.process_elapsed(1) == secs
+
+
+# --------------------------------------- renamed while asleep, then a restart
+
+def restarted_after_rename(fake: FakeHerdr) -> None:
+    slept_entry(fake)
+    fake.agents[0].pop("agent", None)                       # the restart dropped the claim
+    fake.agents[0].update(terminal_id="term-new", label="크롤방어")   # renamed while asleep: no 💤
+
+
+def test_reconcile_keeps_a_renamed_slept_pane_whose_stub_runs(fake: FakeHerdr) -> None:
+    restarted_after_rename(fake)
+    fake.stub_panes.add("w1:p1")                            # Herdr ran the claim's resume command
+    sleeper.reconcile([])
+    row = journal()["w1:p1"]
+    assert row["uuid"] == UUID and row["terminal_id"] == "term-new" and not any(k.startswith("orphan:") for k in journal())
+
+
+def test_a_renamed_pane_without_our_stub_is_still_treated_as_reused(fake: FakeHerdr) -> None:
+    restarted_after_rename(fake)                            # no stub there: a recycled pane id, as before
+    sleeper.reconcile([])
+    assert "w1:p1" not in journal() and journal()[ORPHAN]["orphaned_from"] == "w1:p1"
+
+
+def test_the_stub_takes_back_a_row_orphaned_from_its_pane(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch,
+                                                          capsys: pytest.CaptureFixture[str]) -> None:
+    restarted_after_rename(fake)
+    sleeper.reconcile([])                                   # orphaned before the stub started (the 01:52 order)
+    assert ORPHAN in journal()
+    stub_ready_after_orphan = journal()[ORPHAN]
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "")
+    monkeypatch.setattr(sleeper.os, "getcwd", lambda: stub_ready_after_orphan["cwd"])
+    monkeypatch.setattr(sleeper.shutil, "which", lambda b: f"/opt/bin/{b}")
+    execs: list[str] = []
+    monkeypatch.setattr(sleeper.os, "execvp", lambda b, a: execs.append(b))
+    assert sleeper.cmd_stub("w1:p1", UUID) == 0
+    assert "no journal entry" not in capsys.readouterr().out and execs == ["/opt/bin/claude"]
+    assert ORPHAN not in journal() and journal()["w1:p1"]["terminal_id"] == "term-new"
+
+
+def test_reconcile_takes_back_an_orphan_once_its_stub_runs(fake: FakeHerdr) -> None:
+    restarted_after_rename(fake)
+    sleeper.reconcile([])
+    fake.stub_panes.add("w1:p1")                            # the stub came up after the orphaning tick
+    sleeper.reconcile([])
+    assert journal()["w1:p1"]["phase"] == "asleep" and ORPHAN not in journal()
+
+
+def test_an_orphan_is_never_adopted_over_another_sessions_row(fake: FakeHerdr) -> None:
+    restarted_after_rename(fake)
+    sleeper.reconcile([])
+    j = journal(); j["w1:p1"] = {**j[ORPHAN], "uuid": "other", "pane_id": "w1:p1", "phase": "asleep"}
+    for k in ("orphaned_from", "orphan_reason", "orphaned_at"):
+        j["w1:p1"].pop(k, None)
+    sleeper.write_json(sleeper.JOURNAL, j)
+    assert sleeper.adopt_orphan("w1:p1", UUID) is None and journal()["w1:p1"]["uuid"] == "other"

@@ -846,6 +846,38 @@ def is_orphan(key: str, entry: dict) -> bool:
             or str(entry.get("pane_id") or "").startswith("orphan:"))
 
 
+def rejoin(journal: dict, key: str, pane: str, terminal: str | None) -> dict:
+    """Move an orphaned row back to its pane as asleep (its stub runs there for this session)."""
+    row = {k: v for k, v in journal.pop(key).items() if k not in ("orphaned_from", "orphan_reason", "orphaned_at")}
+    row.update(pane_id=pane, phase="asleep", terminal_id=terminal or row.get("terminal_id"))
+    journal[pane] = row
+    say(f"re-adopted {key} into {pane}: its stub runs there for session {row['uuid']}")
+    event("adopted", pane=pane, key=key, uuid=row["uuid"])
+    return row
+
+
+def adopt_orphan(pane: str, uuid: str) -> dict | None:
+    """The stub's way back: a row orphaned from this pane for this session, re-keyed to it.
+
+    Herdr only starts the stub here from the claim's resume command, which names this pane and
+    session, so a matching orphan is this pane's row, not a guess. None when there is none.
+    """
+    with locked():
+        journal = read_json(JOURNAL)
+        if (journal.get(pane) or {}).get("uuid") == uuid:
+            return journal[pane]
+        if pane in journal:
+            return None  # the pane holds another session's row: never overwrite it
+        key = next((k for k, row in journal.items() if is_orphan(k, row) and isinstance(row, dict)
+                    and row.get("uuid") == uuid and row.get("orphaned_from") == pane), None)
+        if key is None:
+            return None
+        terminal = (herdr("pane", "get", pane, check=False).get("pane") or {}).get("terminal_id")
+        row = rejoin(journal, key, pane, terminal)
+        write_json(JOURNAL, journal)
+        return row
+
+
 def orphan_entry(journal: dict, pane: str, reason: str) -> str:
     """Re-key an entry out of the pane namespace (its pane id now belongs to something else).
 
@@ -1733,6 +1765,8 @@ def cmd_stub(pane: str, uuid: str, state_dir: str | None = None) -> int:
     journal = read_json(JOURNAL)
     entry = journal.get(pane) or {}
     if entry.get("uuid") != uuid:
+        entry = adopt_orphan(pane, uuid) or {}
+    if entry.get("uuid") != uuid:
         print(f"herdr-sleeper: no journal entry for {uuid} in {pane}; type `exit` or start an agent by hand")
         return 0
     kind = entry.get("kind") or "claude"
@@ -2161,6 +2195,7 @@ def reconcile(agents: list[dict]) -> None:
     with contextlib.suppress(SleeperError):
         panes = {p.get("pane_id"): p for p in herdr("pane", "list").get("panes", [])}
     changed = False
+    adopted: list[tuple[str, str]] = []
     for pane, entry in list(journal.items()):
         live = by_pane.get(pane)
         live_uuid = ((live or {}).get("agent_session") or {}).get("value")
@@ -2168,6 +2203,9 @@ def reconcile(agents: list[dict]) -> None:
             say(f"reconcile {pane}: malformed journal entry left untouched")
             continue
         if is_orphan(pane, entry):
+            home = entry.get("orphaned_from")
+            if home and home not in journal and stub_running(home, entry["uuid"]) is True:
+                adopted.append((pane, home))  # its pane runs this session's stub again: take it back
             continue  # not bound to a pane any more: by hand only
         kind = entry["kind"]
         if entry.get("phase") == "waking":
@@ -2236,11 +2274,20 @@ def reconcile(agents: list[dict]) -> None:
                 changed = True
                 say(f"reconcile: {pane} moved to {moved} (terminal {entry['terminal_id']})")
             elif pane in panes and identity(entry, panes[pane]) == "reused":
-                orphan_entry(journal, pane, f"pane id now belongs to terminal {panes[pane].get('terminal_id')} "
-                                            f"in {panes[pane].get('cwd')}")
+                if stub_running(pane, entry["uuid"]) is True:
+                    # our own stub, started by Herdr from the claim's resume command, for this very
+                    # session: the slept pane after a restart, renamed while asleep (so no 💤 label)
+                    entry["terminal_id"] = panes[pane].get("terminal_id")
+                    say(f"reconcile {pane}: restarted pane runs this session's stub; terminal re-recorded")
+                else:
+                    orphan_entry(journal, pane, f"pane id now belongs to terminal {panes[pane].get('terminal_id')} "
+                                                f"in {panes[pane].get('cwd')}")
                 changed = True
         if journal.get(pane) is entry and entry.get("phase", "asleep") == "asleep":
             register_resume(pane, entry, (panes.get(pane) or {}).get("terminal_id"))
+    for key, home in adopted:
+        rejoin(journal, key, home, (panes.get(home) or {}).get("terminal_id"))
+        changed = True
     if changed:
         write_json(JOURNAL, journal)
 
