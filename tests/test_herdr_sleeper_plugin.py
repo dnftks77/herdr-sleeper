@@ -1805,3 +1805,23 @@ def test_focus_delegated_to_the_stub_finishes_the_row(fake: FakeHerdr) -> None:
     focus_env("w1:p1")
     assert sleeper.cmd_on_focus() == 0
     assert journal() == {} and fake.agents[0]["name"] == "a"
+
+
+# --------------------------------------------- argv with nothing to replay
+
+@pytest.mark.parametrize("argv", [[], ["--resume", UUID]])   # plain `claude`; Herdr's restored resume
+def test_a_known_empty_argv_still_wakes(fake: FakeHerdr, monkeypatch: pytest.MonkeyPatch, argv: list[str]) -> None:
+    """Nothing to replay is not "unknown": the row keeps [] and every wake path resumes it."""
+    fake.argv = argv
+    entry = stub_ready(fake, monkeypatch)
+    assert entry["argv"] == []
+    execvps: list[list[str]] = []
+    monkeypatch.setattr(sleeper.os, "execvp", lambda b, a: execvps.append(a))
+    assert sleeper.cmd_stub("w1:p1", UUID) == 0
+    assert execvps == [["claude", "--resume", UUID]]
+
+    sleeper.write_json(sleeper.JOURNAL, {"w1:p1": entry})       # the same row, woken by command instead
+    fake.stub_panes.discard("w1:p1")
+    assert sleeper.wake_entry(entry)
+    start = next(c for c in fake.calls if c[:2] == ("agent", "start"))
+    assert start[-2:] == ("--resume", UUID) and "--dangerously-skip-permissions" not in start

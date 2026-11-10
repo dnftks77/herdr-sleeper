@@ -1,5 +1,9 @@
 # herdr-sleeper — sleep idle resumable agents, wake them later
 
+> Fork of [djbclark/herdr-sleeper](https://github.com/djbclark/herdr-sleeper)
+> that wakes agents whose argv had nothing to replay (plain `claude`, or Herdr's
+> restored `claude --resume <id>`) instead of refusing them as unknown.
+
 A Herdr plugin that sleeps idle agent panes after a user-chosen window and
 wakes them — on focus, by pressing Enter in the pane, or by command. It is
 the standalone [`scripts/herdr-sleeper`](https://github.com/djbclark/herdr/tree/herdr-sleeper/scripts/herdr-sleeper)
@@ -207,7 +211,7 @@ focus/command wakes only.
 
 ## Tests
 
-`python3 -m pytest tests/ -q` — 156 tests: the decision logic, the
+`python3 -m pytest tests/ -q` — 158 tests: the decision logic, the
 sleep/wake state machine, pane identity and orphans, the watcher tick and
 loop (idle clocks, backoff, the watcher lock), the focus hook, the stub,
 the 3.9 TOML subset parser, and legacy migration, against a fake `herdr`.

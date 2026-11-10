@@ -1098,7 +1098,9 @@ def sleep_agent(agent: dict, idle_hours: float, exclude: set[str], dry_run: bool
         "terminal_id": agent.get("terminal_id") or pane_info.get("terminal_id"),
         "name": agent.get("name"), "label": label, "title": agent.get("terminal_title_stripped"),
         "cwd": agent.get("cwd"), "uuid": uuid, "kind": kind,
-        "argv": replay or None, "slept_at": dt.datetime.now().isoformat(timespec="seconds"),
+        # [] is a known argv with nothing to replay (`claude`, or Herdr's restored `claude --resume <id>`);
+        # None is reserved for "unknown", which every wake path refuses
+        "argv": replay, "slept_at": dt.datetime.now().isoformat(timespec="seconds"),
         "status": agent.get("agent_status"), "phase": "exit-requested",
     }
     name = wake_name(entry)
