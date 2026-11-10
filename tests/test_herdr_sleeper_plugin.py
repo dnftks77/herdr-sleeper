@@ -51,7 +51,7 @@ def state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Isolated state dir + transcript root, with a transcript for UUID on disk."""
     d = tmp_path / "state"
     for name in ("STATE_DIR", "JOURNAL", "SNAPSHOT", "EVENTS", "LOGFILE", "LOCK", "WATCHER_PID",
-                 "IDLE_FILE", "WATCHER_LOCK"):
+                 "IDLE_FILE", "WATCHER_LOCK", "NAMES_FILE"):
         base = getattr(sleeper, name, None)
         if base is None:
             continue
@@ -323,11 +323,12 @@ def test_load_config_precedence(state: Path, monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(sleeper, "CONFIG_FILE", cfg)
     for var in ("HERDR_SLEEPER_IDLE_HOURS", "HERDR_SLEEPER_IDLE", "HERDR_SLEEPER_EXCLUDE",
                 "HERDR_SLEEPER_AGENTS", "HERDR_SLEEPER_POLL_SECONDS", "HERDR_SLEEPER_NOTIFY",
-                "HERDR_SLEEPER_WAKE_ON_FOCUS", "HERDR_SLEEPER_PREVIEW_LINES"):
+                "HERDR_SLEEPER_WAKE_ON_FOCUS", "HERDR_SLEEPER_PREVIEW_LINES", "HERDR_SLEEPER_SYNC_NAMES"):
         monkeypatch.delenv(var, raising=False)
     values, source = sleeper.load_config()
     assert values == {"idle_hours": 12.0, "agents": ["claude", "opencode"], "exclude": [],
-                      "poll_seconds": 60, "notify": True, "wake_on_focus": True, "preview_lines": 100}
+                      "poll_seconds": 60, "notify": True, "wake_on_focus": True, "preview_lines": 100,
+                      "sync_names": True}
     assert set(source.values()) == {"default"}
 
     cfg.write_text('idle = "90m"\nexclude = "orc"\npoll_seconds = 30\nnotify = false\npreview_lines = 40\n')
@@ -2108,3 +2109,76 @@ def test_transcript_tail_is_read_once_until_the_file_changes(state: Path, monkey
     write_transcript(state, [human("u1", None, "hello"), human("u2", "u1", "again")])
     sleeper.transcript_tail(p, 1 << 20)
     assert len(reads) == 2
+
+
+# ------------------------------------------------------------ name sync
+
+def prompts(fake: FakeHerdr) -> list[str]:
+    return [c[3] for c in fake.calls if c[:2] == ("agent", "prompt")]
+
+
+def named(fake: FakeHerdr, label: str | None, title: str, status: str = "idle") -> None:
+    fake.agents[0].update(label=label, terminal_title_stripped=title, agent_status=status)
+
+
+def test_name_sync_only_records_what_it_first_sees(fake: FakeHerdr) -> None:
+    named(fake, "my name", "Claude title")          # already different before the sync existed
+    sleeper.sync_names(fake.agents)
+    sleeper.sync_names(fake.agents)
+    assert prompts(fake) == [] and fake.agents[0]["label"] == "my name"
+
+
+def test_renaming_the_pane_renames_the_idle_session(fake: FakeHerdr) -> None:
+    named(fake, "Title", "Title")
+    sleeper.sync_names(fake.agents)
+    named(fake, "m6 잡도리", "Title", status="working")   # renamed while the agent works: wait
+    sleeper.sync_names(fake.agents)
+    assert prompts(fake) == []
+    named(fake, "m6 잡도리", "Title")
+    sleeper.sync_names(fake.agents)
+    assert prompts(fake) == ["/rename m6 잡도리"]
+    named(fake, "m6 잡도리", "m6 잡도리")                 # the title followed: settled
+    sleeper.sync_names(fake.agents)
+    sleeper.sync_names(fake.agents)
+    assert prompts(fake) == ["/rename m6 잡도리"]
+
+
+def test_a_draft_in_the_composer_is_never_typed_into(fake: FakeHerdr) -> None:
+    named(fake, "Title", "Title")
+    sleeper.sync_names(fake.agents)
+    named(fake, "new", "Title")
+    fake.screen = "⏺ done\n❯ half a thought\n? for shortcuts\n"
+    sleeper.sync_names(fake.agents)
+    assert prompts(fake) == []
+
+
+def test_a_rename_that_does_not_take_is_tried_a_bounded_number_of_times(fake: FakeHerdr) -> None:
+    named(fake, "Title", "Title")
+    sleeper.sync_names(fake.agents)
+    named(fake, "new", "Title")
+    for _ in range(5):
+        sleeper.sync_names(fake.agents)
+    assert prompts(fake) == ["/rename new"] * sleeper.NAME_SYNC_TRIES
+
+
+def test_a_session_rename_renames_the_pane_but_a_generated_title_does_not(fake: FakeHerdr, state: Path) -> None:
+    named(fake, "sso", "old title")
+    sleeper.sync_names(fake.agents)
+    write_transcript(state, [human("u1", None, "hi")])
+    named(fake, "sso", "Claude's new topic")             # Claude retitled itself: the pane keeps its name
+    sleeper.sync_names(fake.agents)
+    assert fake.agents[0]["label"] == "sso"
+    write_transcript(state, [human("u1", None, "hi"), {"type": "agent-name", "agentName": "via rename"}])
+    named(fake, "sso", "via rename")                     # the user typed /rename via rename
+    sleeper.sync_names(fake.agents)
+    assert fake.agents[0]["label"] == "via rename" and prompts(fake) == []
+
+
+def test_sleep_marks_and_unnamed_panes_are_left_alone(fake: FakeHerdr) -> None:
+    named(fake, "Title", "Title")
+    sleeper.sync_names(fake.agents)
+    named(fake, sleeper.SLEEP_MARK + "Title", "Title")
+    sleeper.sync_names(fake.agents)
+    named(fake, None, "Title")
+    sleeper.sync_names(fake.agents)
+    assert prompts(fake) == []
