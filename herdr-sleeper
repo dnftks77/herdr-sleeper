@@ -999,28 +999,17 @@ SLEEPABLE_STATUSES = {"idle", "done"}
 
 # ------------------------------------------------------------ busy session
 
-# An idle agent can still have work in flight that dies with its process: background commands
-# and monitors (child shells), background agents and workflows (in-process; their transcripts
-# keep being written), and session-only schedules — CronCreate jobs ("not written to disk, dies
-# when Claude exits") and ScheduleWakeup. Sleeping such a session would silently cancel them.
+# An idle agent can still have work in flight that sleeping would stop: background commands and
+# monitors (child shells), background agents and workflows (in-process; their transcripts keep
+# being written), and session schedules — CronCreate jobs and ScheduleWakeup. Despite "Session-
+# only … dies when Claude exits", `--resume` restores a session's crons from its transcript (seen
+# live: CronList after each wake still listed the 6-hourly job made days earlier), so a cron is
+# live until cancelled or expired whatever process made it, and every run due while the session
+# sleeps would simply be missed.
 BUSY_RECENT_SECONDS = 600            # a subagent/workflow transcript written this recently is live
 CRON_RECURRING_TTL = 7 * 24 * 3600   # recurring session crons auto-expire after 7 days
 CRON_ONESHOT_TTL = 24 * 3600         # a one-shot fires within a day of being made
 TOOL_MARKERS = (b'"CronCreate"', b'"CronDelete"', b'"ScheduleWakeup"', b'"tool_use_id"')
-
-
-def process_elapsed(pid: int) -> float | None:
-    """Seconds since pid started (`ps -o etime`, locale-free), None when it cannot be read."""
-    try:
-        out = subprocess.run(["ps", "-o", "etime=", "-p", str(pid)], capture_output=True, text=True,
-                             timeout=10).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        return None
-    m = re.fullmatch(r"(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)", out)
-    if not m:
-        return None
-    d, h, mi, se = (int(x or 0) for x in m.groups())
-    return float(((d * 24 + h) * 60 + mi) * 60 + se)
 
 
 def child_commands(pid: int) -> list[str]:
@@ -1039,9 +1028,9 @@ def iso_epoch(stamp: object) -> float | None:
         return None
 
 
-def pending_schedules(path: Path, since: float, now: float) -> str | None:
-    """A CronCreate job or ScheduleWakeup made by the running process (since = its start) that is
-    still pending, as a reason; None when there is none. Only lines naming the tools are parsed."""
+def pending_schedules(path: Path, now: float) -> str | None:
+    """A CronCreate job (not cancelled, not expired) or a ScheduleWakeup not yet due, as a reason;
+    None when there is none. Only lines naming the tools are parsed."""
     uses: dict[str, tuple[str, dict, float]] = {}
     results: dict[str, str] = {}
     with path.open("rb") as fh:
@@ -1059,7 +1048,7 @@ def pending_schedules(path: Path, since: float, now: float) -> str | None:
                     continue
                 if b.get("type") == "tool_use" and b.get("name") in ("CronCreate", "CronDelete", "ScheduleWakeup"):
                     ts = iso_epoch(e.get("timestamp"))
-                    if ts is not None and ts >= since:
+                    if ts is not None:
                         uses[str(b.get("id"))] = (b["name"], b.get("input") or {}, ts)
                 elif b.get("type") == "tool_result":
                     text = b.get("content")
@@ -1076,7 +1065,7 @@ def pending_schedules(path: Path, since: float, now: float) -> str | None:
             continue
         ttl = CRON_RECURRING_TTL if inp.get("recurring", True) else CRON_ONESHOT_TTL
         if now - ts < ttl:
-            return f"session-only scheduled job {m.group(1)} ({inp.get('cron', '?')}) would die with it"
+            return f"scheduled job {m.group(1)} ({inp.get('cron', '?')}) would not run while asleep"
     wakes = sorted((ts, inp) for name, inp, ts in uses.values() if name == "ScheduleWakeup")
     if wakes and not wakes[-1][1].get("stop"):
         ts, inp = wakes[-1]
@@ -1103,8 +1092,7 @@ def session_busy(pane: str, uuid: str) -> str | None:
         newest = max((f.stat().st_mtime for f in side.rglob("*.jsonl")), default=0.0)
         if now - newest < BUSY_RECENT_SECONDS:
             return "a background agent or workflow is still writing"
-    elapsed = process_elapsed(int(pid))
-    return pending_schedules(path, now - elapsed if elapsed is not None else 0.0, now)
+    return pending_schedules(path, now)
 
 
 def assess(agent: dict, all_agents: list[dict], idle_hours: float, journal: dict,
