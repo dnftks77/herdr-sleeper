@@ -2296,6 +2296,8 @@ def test_a_pending_wakeup_keeps_the_session_awake(fake: FakeHerdr, state: Path) 
     write_transcript(state, tool_rows("ScheduleWakeup", {"delaySeconds": 1200, "prompt": "x"}, "Next wakeup", 300, "w1"))
     ok, reason = busy(fake)
     assert not ok and "wakeup is pending" in reason
+    write_transcript(state, tool_rows("ScheduleWakeup", {"delaySeconds": 1200, "prompt": "x"}, "Next wakeup", 1320, "w1"))
+    assert not busy(fake)[0]                                  # just due: the woken turn may not be working yet
     write_transcript(state, tool_rows("ScheduleWakeup", {"delaySeconds": 1200, "prompt": "x"}, "Next wakeup", 1800, "w1"))
     assert busy(fake)[0]                                      # already fired
     write_transcript(state, tool_rows("ScheduleWakeup", {"delaySeconds": 1200, "prompt": "x"}, "Next wakeup", 600, "w1")

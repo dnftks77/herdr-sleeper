@@ -1009,6 +1009,8 @@ SLEEPABLE_STATUSES = {"idle", "done"}
 BUSY_RECENT_SECONDS = 600            # a subagent/workflow transcript written this recently is live
 CRON_RECURRING_TTL = 7 * 24 * 3600   # recurring session crons auto-expire after 7 days
 CRON_ONESHOT_TTL = 24 * 3600         # a one-shot fires within a day of being made
+WAKEUP_GRACE_SECONDS = 300          # a wakeup just due: the harness picks the exact minute and the
+                                    # woken turn takes a moment to report working
 TOOL_MARKERS = (b'"CronCreate"', b'"CronDelete"', b'"ScheduleWakeup"', b'"tool_use_id"')
 
 
@@ -1070,7 +1072,7 @@ def pending_schedules(path: Path, now: float) -> str | None:
     if wakes and not wakes[-1][1].get("stop"):
         ts, inp = wakes[-1]
         due = ts + min(max(float(inp.get("delaySeconds") or 0), 60), 3600)
-        if due > now:
+        if due + WAKEUP_GRACE_SECONDS > now:
             return f"a scheduled wakeup is pending ({dt.datetime.fromtimestamp(due).strftime('%H:%M')})"
     return None
 
