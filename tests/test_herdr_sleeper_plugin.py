@@ -139,6 +139,8 @@ class FakeHerdr:
         if not present:
             return [{"argv0": "zsh", "name": "zsh", "argv": ["-zsh"], "pid": 50}]   # an idle pane lists its shell
         kind = (a or {}).get("agent") or "claude"
+        if kind == sleeper.CLAIM_AGENT:   # a claim is a report, not a process: what runs is the agent
+            kind = ((a or {}).get("agent_session") or {}).get("agent") or "claude"
         proc = {"argv0": kind, "name": kind, "argv": [] if self.empty_argv else [kind, *self.argv]}
         if not self.pidless:
             proc["pid"] = a.get("pid_hint", 1)
@@ -1729,6 +1731,41 @@ def test_reconcile_restores_asleep_when_the_waking_stub_died(fake: FakeHerdr, mo
     row = journal()["w1:p1"]
     assert row["phase"] == "asleep" and "waking_pid" not in row
     assert any(c[:2] == ("pane", "report-agent") for c in fake.calls)   # the sidebar row is claimed back
+
+
+def test_a_waking_row_stays_while_its_session_restarts_under_a_new_pid(fake: FakeHerdr,
+                                                                       monkeypatch: pytest.MonkeyPatch) -> None:
+    """Live 2026-11-17: the stub's agent exited after 13 s and the pane's shell started the session again;
+    the tick saw neither the stub's pid nor a Herdr agent yet and put the row back, claiming a live pane."""
+    slept_entry(fake)
+    fake.agents[0].pop("agent", None)
+    j = journal(); j["w1:p1"].update(phase="waking", waking_pid=4242); sleeper.write_json(sleeper.JOURNAL, j)
+    monkeypatch.setattr(sleeper, "waking_alive", lambda e: False)
+    fake.process_override = True
+    fake.argv = ["--dangerously-skip-permissions", "--resume", UUID]
+    fake.calls.clear()
+    sleeper.reconcile(fake.agents)
+    assert journal()["w1:p1"]["phase"] == "waking" and not any(c[:2] == ("pane", "report-agent") for c in fake.calls)
+    fake.argv = ["--resume", "another-session"]                 # something else there: back to asleep as before
+    sleeper.reconcile(fake.agents)
+    assert journal()["w1:p1"]["phase"] == "asleep"
+
+
+def test_reconcile_releases_a_stale_claim_over_its_running_session(fake: FakeHerdr) -> None:
+    fake.agents[0].update(agent=sleeper.CLAIM_AGENT, agent_session={"agent": "claude", "value": UUID})
+    fake.process_override = True
+    fake.argv = ["--resume", "another-session"]
+    sleeper.reconcile(fake.agents)
+    assert fake.agents[0]["agent"] == sleeper.CLAIM_AGENT       # not the session it stood for: leave it
+    sleeper.write_json(sleeper.JOURNAL, {"w1:p1": {"pane_id": "w1:p1", "uuid": UUID, "kind": "claude",
+                                                   "phase": "asleep"}})
+    fake.argv = ["--dangerously-skip-permissions", "--resume", UUID]
+    sleeper.reconcile(fake.agents)
+    assert fake.agents[0]["agent"] == sleeper.CLAIM_AGENT       # a row still owns the pane: reconcile's job
+    sleeper.write_json(sleeper.JOURNAL, {})
+    sleeper.reconcile(fake.agents)
+    assert "agent" not in fake.agents[0]                         # no row, its session running: released
+    assert "released a stale claim" in sleeper.LOGFILE.read_text()
 
 
 def test_reconcile_marks_a_waking_row_displaced_by_another_session(fake: FakeHerdr) -> None:

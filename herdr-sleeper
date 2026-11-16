@@ -619,6 +619,13 @@ def agent_process(pane: str, kind: str) -> tuple[bool | None, list[str] | None, 
     return (None, None, None) if unknown else (False, None, None)
 
 
+def resuming_here(pane: str, kind: str, uuid: str) -> bool:
+    """Is this session's agent the pane's foreground process? Any pid: a stub's exec'd agent can exit
+    and the pane's shell start the session again (live 2026-11-17: 13 s later, a new pid)."""
+    present, argv, _pid = agent_process(pane, kind)
+    return present is True and any(t == uuid or t.endswith("=" + uuid) for t in argv or [])
+
+
 def stub_argv_index(argv: list[str]) -> int | None:
     """Index of the script token when argv is our wake stub, else None.
 
@@ -2243,7 +2250,7 @@ def reconcile(agents: list[dict]) -> None:
                 changed = True
                 say(f"reconcile {pane}: the stub's wake of {entry['uuid']} left {live_uuid} there; entry kept "
                     f"for manual recovery: {manual_command(entry)}")
-            elif not live and waking_alive(entry) is False:
+            elif not live and waking_alive(entry) is False and not resuming_here(pane, kind, entry["uuid"]):
                 put_back(journal, pane, entry, "the waking stub exited before its session appeared")
                 changed = True
                 claim(pane, kind, done=entry.get("status") == "done", uuid=entry["uuid"])
@@ -2305,6 +2312,17 @@ def reconcile(agents: list[dict]) -> None:
                 changed = True
         if journal.get(pane) is entry and entry.get("phase", "asleep") == "asleep":
             register_resume(pane, entry, (panes.get(pane) or {}).get("terminal_id"))
+    homes = {e.get("orphaned_from") for e in journal.values() if isinstance(e, dict)}
+    for pane, live in by_pane.items():
+        session = live.get("agent_session") or {}
+        if live.get("agent") != CLAIM_AGENT or pane in journal or pane in homes or not session.get("value"):
+            continue
+        if resuming_here(pane, session.get("agent") or "claude", session["value"]):
+            # our placeholder over the very session it stood for, running again with no row left
+            # (live 2026-11-17: a relaunch raced the wake, the row went back and was then dropped as
+            # running): a claim outranks detection, so the agent showed as sleeping, status unknown
+            release(pane)
+            say(f"reconcile {pane}: released a stale claim over running session {session['value']}")
     for key, home in adopted:
         rejoin(journal, key, home, (panes.get(home) or {}).get("terminal_id"))
         changed = True
