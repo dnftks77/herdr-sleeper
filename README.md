@@ -75,7 +75,11 @@ minutes), a CronCreate job (`--resume` restores a session's crons, so one made
 long ago is live until cancelled — 7 days for recurring, a day for
 one-shot — and its runs would be missed while asleep), or a pending
 ScheduleWakeup (kept for 5 minutes past its due time, until the woken turn
-reports working). The check runs last and reports `busy: …`.
+reports working). Nor while it waits on you: a question (AskUserQuestion), a
+plan to approve or a permission prompt — a tool call with no result yet in the
+transcript. Herdr reads these off the screen as `blocked`, but once reported an
+open question as idle and it was slept an hour later. The check runs last and
+reports `busy: …`.
 
 Names stay in step (`sync_names`, on by default): renaming a claude pane in
 Herdr types `/rename <name>` into its agent — only while it is idle with a

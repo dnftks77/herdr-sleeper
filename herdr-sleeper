@@ -1077,6 +1077,33 @@ def pending_schedules(path: Path, now: float) -> str | None:
     return None
 
 
+def awaiting_answer(path: Path) -> str | None:
+    """The tool call the session still waits on (a question, a plan to approve, a permission prompt),
+    as a reason; None when every tool call since the last prompt has its result.
+
+    Herdr reads a question off the screen as `blocked`, but it has reported an open AskUserQuestion
+    as idle (live 2026-11-16: slept an hour after asking; resume marks the call interrupted and the
+    question is gone). The transcript cannot miss it: the call has no tool_result until answered."""
+    entries, _whole = transcript_tail(path, RECAP_WINDOWS[0])
+    answered: set[str] = set()
+    for e in reversed(entries):
+        if e.get("isMeta"):
+            continue  # injected context ("[Image: …]", skill text), not a prompt
+        msg = e.get("message")
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if e.get("type") == "user" and isinstance(content, str):
+            return None  # a typed prompt after any tool call
+        blocks = [b for b in content if isinstance(b, dict)] if isinstance(content, list) else []
+        if e.get("type") == "user":
+            answered.update(str(b.get("tool_use_id")) for b in blocks if b.get("type") == "tool_result")
+            if any(b.get("type") == "text" for b in blocks) and not any(b.get("type") == "tool_result" for b in blocks):
+                return None
+        for b in blocks:  # parallel calls are answered one by one, so any of them can be the open one
+            if e.get("type") == "assistant" and b.get("type") == "tool_use" and str(b.get("id")) not in answered:
+                return f"waiting for an answer ({b.get('name', '?')})"
+    return None
+
+
 def session_busy(pane: str, uuid: str) -> str | None:
     """Why this idle claude session still has work that sleeping would kill, or None."""
     present, _argv, pid = agent_process(pane, "claude")
@@ -1088,6 +1115,9 @@ def session_busy(pane: str, uuid: str) -> str | None:
     path = transcript_for(uuid)
     if path is None:
         return None
+    waiting = awaiting_answer(path)
+    if waiting:
+        return waiting
     now = time.time()
     side = path.with_suffix("")  # <uuid>/ holds subagents/ and workflows/
     if side.is_dir():

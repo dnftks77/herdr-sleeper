@@ -2305,6 +2305,26 @@ def test_a_pending_wakeup_keeps_the_session_awake(fake: FakeHerdr, state: Path) 
     assert busy(fake)[0]                                      # the loop was stopped
 
 
+def test_an_unanswered_question_keeps_the_session_awake(fake: FakeHerdr, state: Path) -> None:
+    # Herdr reported this as idle (2026-11-16); the transcript still shows the call without a result.
+    asked = tool_rows("AskUserQuestion", {"questions": [{"question": "Mark done?", "multiSelect": True}]},
+                      "answered", 3700, "q1")
+    meta = {"type": "user", "isMeta": True, "timestamp": iso(3700), "message": {"role": "user", "content": "[Image: x]"}}
+    write_transcript(state, asked[:1] + [meta])
+    ok, reason = busy(fake)
+    assert not ok and reason == "busy: waiting for an answer (AskUserQuestion)"
+    write_transcript(state, asked)
+    assert busy(fake)[0]                                      # answered
+    write_transcript(state, asked[:1] + [{"type": "user", "timestamp": iso(60),
+                                          "message": {"role": "user", "content": "never mind"}}])
+    assert busy(fake)[0]                                      # a prompt after it: no longer waiting
+    parallel = tool_rows("Bash", {"command": "ls"}, "x", 3700, "b1")
+    write_transcript(state, parallel[:1] + tool_rows("Edit", {"file_path": "/x"}, "ok", 3700, "e1"))
+    assert busy(fake)[1] == "busy: waiting for an answer (Bash)"   # the earlier of two parallel calls is open
+    write_transcript(state, parallel)
+    assert busy(fake)[0]
+
+
 # --------------------------------------- renamed while asleep, then a restart
 
 def restarted_after_rename(fake: FakeHerdr) -> None:
