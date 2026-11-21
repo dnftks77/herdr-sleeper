@@ -1015,10 +1015,13 @@ SLEEPABLE_STATUSES = {"idle", "done"}
 # sleeps would simply be missed.
 BUSY_RECENT_SECONDS = 600            # a subagent/workflow transcript written this recently is live
 CRON_RECURRING_TTL = 7 * 24 * 3600   # recurring session crons auto-expire after 7 days
-CRON_ONESHOT_TTL = 24 * 3600         # a one-shot fires within a day of being made
-WAKEUP_GRACE_SECONDS = 300          # a wakeup just due: the harness picks the exact minute and the
-                                    # woken turn takes a moment to report working
+CRON_ONESHOT_TTL = 24 * 3600         # a one-shot whose cron line this cannot read: assume a day
+WAKEUP_GRACE_SECONDS = 300          # a wakeup or one-shot just due: the harness picks the exact minute
+                                    # and the woken turn takes a moment to report working
 TOOL_MARKERS = (b'"CronCreate"', b'"CronDelete"', b'"ScheduleWakeup"', b'"tool_use_id"')
+CRON_FIELDS = ((0, 59), (0, 23), (1, 31), (1, 12), (0, 7))
+# CronCreate answers "Scheduled recurring job <id>", and "one-shot job <id>" or (newer) "one-shot task <id>"
+CRON_MADE = re.compile(r"(?:job|task) ([0-9a-f]{6,})")
 
 
 def child_commands(pid: int) -> list[str]:
@@ -1035,6 +1038,55 @@ def iso_epoch(stamp: object) -> float | None:
         return dt.datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).timestamp()
     except ValueError:
         return None
+
+
+def cron_values(field: str, lo: int, hi: int) -> set[int] | None:
+    """The values one cron field allows (`*`, `n`, `a-b`, any of them `/step`, comma lists); None when
+    the field is not one this reads."""
+    out: set[int] = set()
+    for part in field.split(","):
+        body, slash, step = part.partition("/")
+        if slash and not (step.isdigit() and int(step) > 0):
+            return None
+        if body == "*":
+            a, b = lo, hi
+        elif re.fullmatch(r"\d+-\d+", body):
+            a, b = (int(x) for x in body.split("-"))
+        elif body.isdigit():
+            a, b = int(body), (hi if slash else int(body))
+        else:
+            return None
+        if not lo <= a <= b <= hi:
+            return None
+        out.update(range(a, b + 1, int(step) if slash else 1))
+    return out
+
+
+def cron_next(spec: str, after: float) -> float | None:
+    """The first local minute after `after` that a 5-field cron line matches; None when the line is not
+    one this reads or nothing matches within a year. As in cron, a restricted day-of-month and
+    day-of-week match either."""
+    fields = spec.split()
+    if len(fields) != 5:
+        return None
+    sets = [cron_values(f, lo, hi) for f, (lo, hi) in zip(fields, CRON_FIELDS)]
+    if any(s is None for s in sets):
+        return None
+    minutes, hours, doms, months, dows = (sorted(s or ()) for s in sets)
+    dows = [d % 7 for d in dows]
+    either = not fields[2].startswith("*") and not fields[4].startswith("*")
+    start = dt.datetime.fromtimestamp(after).replace(second=0, microsecond=0) + dt.timedelta(minutes=1)
+    for n in range(367):
+        day = start.date() + dt.timedelta(days=n)
+        dom_ok, dow_ok = day.day in doms, day.isoweekday() % 7 in dows
+        if day.month not in months or not ((dom_ok or dow_ok) if either else (dom_ok and dow_ok)):
+            continue
+        for h in hours:
+            for m in minutes:
+                t = dt.datetime.combine(day, dt.time(h, m))
+                if t >= start:
+                    return t.timestamp()
+    return None
 
 
 def pending_schedules(path: Path, now: float) -> str | None:
@@ -1069,11 +1121,15 @@ def pending_schedules(path: Path, now: float) -> str | None:
     for k, (name, inp, ts) in uses.items():
         if name != "CronCreate":
             continue
-        m = re.search(r"job ([0-9a-f]{6,})", results.get(k, ""))
+        m = CRON_MADE.search(results.get(k, ""))
         if not m or m.group(1) in cancelled:
             continue
-        ttl = CRON_RECURRING_TTL if inp.get("recurring", True) else CRON_ONESHOT_TTL
-        if now - ts < ttl:
+        if inp.get("recurring", True):
+            live = now - ts < CRON_RECURRING_TTL
+        else:   # fires once at the next match, which can be days away ("tomorrow 9:37pm" made at 8:59pm)
+            due = cron_next(str(inp.get("cron", "")), ts)
+            live = now - ts < CRON_ONESHOT_TTL if due is None else now < due + WAKEUP_GRACE_SECONDS
+        if live:
             return f"scheduled job {m.group(1)} ({inp.get('cron', '?')}) would not run while asleep"
     wakes = sorted((ts, inp) for name, inp, ts in uses.values() if name == "ScheduleWakeup")
     if wakes and not wakes[-1][1].get("stop"):

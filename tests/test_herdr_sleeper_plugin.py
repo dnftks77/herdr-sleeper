@@ -2326,7 +2326,41 @@ def test_session_crons_keep_the_session_awake_until_gone(fake: FakeHerdr, state:
     assert busy(fake)[0]
     write_transcript(state, tool_rows("CronCreate", {"cron": "0 9 * * *", "recurring": False},
                                       "Scheduled one-shot job abcdef12 (0 9 * * *).", 30 * 3600, "t3"))
-    assert busy(fake)[0]                                      # a one-shot older than a day has fired
+    assert busy(fake)[0]                                      # its 9:00 came within the day: fired
+
+
+def oneshot_for(due: dt.datetime, made_ago: float) -> list[dict[str, Any]]:
+    cron = f"{due.minute} {due.hour} {due.day} {due.month} *"
+    return tool_rows("CronCreate", {"cron": cron, "prompt": "check", "recurring": False},
+                     f"Scheduled one-shot task aeec6ca2 ({cron}). Next run: x. Session-only", made_ago, "t5")
+
+
+def test_a_one_shot_keeps_the_session_awake_until_it_runs_however_far_ahead(fake: FakeHerdr, state: Path) -> None:
+    # Live 2026-11-20: "37 21 21 11 *" made at 20:59 the day before ("one-shot task" wording) was missed
+    # by the "job <id>" match, and a day's TTL would have expired 38 minutes before it ran.
+    now = dt.datetime.now().replace(second=0, microsecond=0)
+    write_transcript(state, oneshot_for(now + dt.timedelta(hours=23, minutes=38), 3600))
+    ok, reason = busy(fake)
+    assert not ok and "aeec6ca2" in reason
+    write_transcript(state, oneshot_for(now - dt.timedelta(minutes=2), 25 * 3600))
+    assert not busy(fake)[0]                                  # just due: the turn may not be working yet
+    write_transcript(state, oneshot_for(now - dt.timedelta(minutes=10), 25 * 3600))
+    assert busy(fake)[0]                                      # ran
+
+
+def test_cron_next_reads_the_lines_the_harness_writes() -> None:
+    at = dt.datetime(2026, 11, 20, 20, 59, 21).timestamp()   # a Friday
+    def nxt(spec: str) -> str | None:
+        t = sleeper.cron_next(spec, at)
+        return None if t is None else dt.datetime.fromtimestamp(t).strftime("%m-%d %H:%M")
+    assert nxt("37 21 21 11 *") == "11-21 21:37"
+    assert nxt("23 18 21 11 *") == "11-21 18:23"
+    assert sleeper.cron_next("59 20 20 11 *", at) == dt.datetime(2027, 11, 20, 20, 59).timestamp()   # passed: next year
+    assert nxt("*/5 * * * *") == "11-20 21:00"
+    assert nxt("17 5,11,17,23 * * *") == "11-20 23:17"
+    assert nxt("0 9 * * 1-5") == "11-23 09:00"               # weekdays: past the weekend
+    assert nxt("0 9 1 * 0") == "11-22 09:00"                 # day-of-month or Sunday, as in cron
+    assert nxt("0 9 30 2 *") is None and nxt("@daily") is None and nxt("61 * * * *") is None
 
 
 def test_a_pending_wakeup_keeps_the_session_awake(fake: FakeHerdr, state: Path) -> None:

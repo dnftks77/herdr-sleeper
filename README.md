@@ -72,8 +72,9 @@ An idle claude session is not slept while work would die with it: a
 background command or monitor (a child shell of the agent), a background
 agent or workflow (its transcript under `<session>/` written in the last 10
 minutes), a CronCreate job (`--resume` restores a session's crons, so one made
-long ago is live until cancelled — 7 days for recurring, a day for
-one-shot — and its runs would be missed while asleep), or a pending
+long ago is live until cancelled — 7 days for recurring, until 5 minutes
+past its run time for one-shot, even days ahead — and its runs would be
+missed while asleep), or a pending
 ScheduleWakeup (kept for 5 minutes past its due time, until the woken turn
 reports working). Nor while it waits on you: a question (AskUserQuestion), a
 plan to approve or a permission prompt — a tool call with no result yet in the
